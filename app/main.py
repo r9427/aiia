@@ -1,17 +1,20 @@
-# from agents.agent1.entry import run as run1
-# from agents.agent2.entry import run as run2
-from agents.agent3.entry import run as run3
+import asyncio
 from util.SystemUtil import SystemUtil
 from proxy_server import start_compat_proxy
 from util.Util import Util
 
+# from agents.agent1.entry import run as run_agent
+# from agents.agent2.entry import run as run_agent
+# from agents.agent3.entry import run as run_agent
+from agents.llama_agent1.entry import run as run_agent
 
-def run_app():
-    run3()
 
-def main():
+async def run_app():
+    await run_agent()
 
-    useSelfHostedModel = True
+async def main():
+
+    useSelfHostedModel = False
     
     if useSelfHostedModel:
         proxy_server, proxy_base_url, model_name, api_key = start_compat_proxy()
@@ -20,18 +23,17 @@ def main():
         SystemUtil.CONFIG.model_qwen_api_key = api_key
 
         try:
-            print("Hello from aiia!")
-            base_path = Util.get_base_path("startup.sh")
-            print(f"Base path: {base_path}")
+            # base_path = Util.get_base_path("startup.sh")
+            # print(f"Base path: {base_path}")
 
-            run_app()
+            await run_app()
         
         finally:
             proxy_server.shutdown()
             proxy_server.server_close()
     else:
-        run_app()
+        await run_app()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

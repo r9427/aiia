@@ -14,7 +14,7 @@ from deepagents.middleware import (
     SummarizationMiddleware
 )
 from deepagents.backends import LocalShellBackend, StateBackend
-from deepagents import create_deep_agent, SubAgent
+from deepagents import AsyncSubAgent, create_deep_agent, SubAgent
 from langchain_openai import ChatOpenAI
 
 from util.SystemUtil import SystemUtil
@@ -34,7 +34,7 @@ backend = LocalShellBackend(
     # env={"PATH": "/usr/bin:/bin"}
 )
 
-def get_agent():
+async def get_agent():
 
     print("qwen model config name='{}', api_key='{}', base_url='{}'".format(
         SystemUtil.CONFIG.model_qwen_model_name,
@@ -47,7 +47,7 @@ def get_agent():
         base_url=SystemUtil.CONFIG.model_qwen_base_url
     )
 
-    visualizer: SubAgent = {
+    visualizer: AsyncSubAgent = {
         "name": "visualizer",
         "model": llm,
         "description": "Generates charts and visualizations from data files in the working directory. Uses matplotlib and seaborn. Saves all figures as PNG files in the working directory. Check if the results are saved, and tell the user.",
@@ -70,7 +70,7 @@ def get_agent():
     return agent
 
 
-def run_agent():
+async def run_agent():
     # Create sample sales data
     data = [
         ["Date", "Product", "Units Sold", "Revenue"],
@@ -90,9 +90,9 @@ def run_agent():
 
     # Upload to backend
     backend.upload_files([(str(targetPath.joinpath("sales_data.csv")), csv_bytes)])
-    # backend.download_files(list_of_filepaths)
-    agent = get_agent()
-    result = agent.invoke({
+    # await backend.download_files(list_of_filepaths)
+    agent = await get_agent()
+    result = await agent.ainvoke({
         "messages": [{"role": "user", "content": "Analyze sales_data.csv. Summarize trends."}]
     })
 

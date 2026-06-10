@@ -30,7 +30,7 @@ Do not guess line counts or positions—ground them in tool results from the sav
 
 
 @tool
-def fetch_text_from_url(url: str) -> str:
+async def fetch_text_from_url(url: str) -> str:
     """Fetch the document from a URL.
     """
     req = urllib.request.Request(
@@ -47,7 +47,7 @@ def fetch_text_from_url(url: str) -> str:
     return text
 
 @tool
-def fetch_content_from_url(url: str) -> str:
+async def fetch_content_from_url(url: str) -> str:
     """抓取指定url对应网页的内容"""
 
     custom_headers = {
@@ -66,7 +66,7 @@ def fetch_content_from_url(url: str) -> str:
     return docs[0].page_content
 
 @tool
-def fetch_content_from_url_with_playwright(url: str) -> str:
+async def fetch_content_from_url_with_playwright(url: str) -> str:
     """使用 Playwright 抓取指定 URL 对应网页的内容，适用于需要执行 JavaScript 的网页"""
 
     sync_browser = create_sync_playwright_browser()
@@ -80,7 +80,7 @@ def fetch_content_from_url_with_playwright(url: str) -> str:
     finally:
         sync_browser.close()
 
-def save_content(content: str):
+async def save_content(content: str):
     print("Saving content")
     output_dir = SystemUtil.OUTPUT_DIR
     output_dir.mkdir(exist_ok=True)
@@ -89,7 +89,7 @@ def save_content(content: str):
     print("Post saved to output/post.md")
 
 
-def run_agent():
+async def run_agent():
 
     print("qwen model config name='{}', api_key='{}', base_url='{}'".format(
         SystemUtil.CONFIG.model_qwen_model_name,
@@ -153,7 +153,7 @@ def run_agent():
         #     {"messages": [{"role": "user", "content": content}]},
         #     config={"configurable": {"thread_id": "great-gatsby-lc"}},
         # )
-        deep_agent_result = deep_agent.invoke(
+        deep_agent_result = await deep_agent.ainvoke(
             {"messages": [{"role": "user", "content": content2}]},
             config={"configurable": {"thread_id": "website-explore-da"}},
         )
@@ -168,7 +168,7 @@ def run_agent():
             else:
                 content = getattr(first_block, "content", None) or getattr(first_block, "text", None) or content
         
-        save_content(content)
+        await save_content(content)
 
         print("\n")
     finally:
