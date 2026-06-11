@@ -3,7 +3,7 @@ name = "aiia"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "deepagents>=0.6.8",
@@ -17,6 +17,8 @@ dependencies = [
     "llama-index-llms-openai-like>=0.7.2",
     "llama-index-tools-tavily-research>=0.5.0",
     "lxml>=6.1.1",
+    "milvus-lite>=3.0",
     "playwright>=1.60.0",
+    "pymilvus[milvus-lite,model]>=3.0.0",
     "requests>=2.34.2",
 ]
