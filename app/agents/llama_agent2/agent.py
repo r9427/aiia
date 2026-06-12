@@ -10,7 +10,7 @@ from util.SystemUtil import SystemUtil
 
 # 全局设置 Qwen Embedding 模型
 Settings.embed_model = DashScopeEmbedding(
-    model_name="text-embedding-v2",  # 千问轻量级嵌入模型，性价比高
+    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,  # 千问轻量级嵌入模型，性价比高
     api_key=SystemUtil.CONFIG.model_qwen_api_key,
     timeout=30                       # 防止网络超时
 )
