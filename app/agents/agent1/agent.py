@@ -1,157 +1,100 @@
-# Step 1: Define tools and model
-
+from deepagents import create_deep_agent
 from langchain.tools import tool
-from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
+from langchain_community.agent_toolkits import PlayWrightBrowserToolkit
+from playwright.async_api import async_playwright
 
 from util.SystemUtil import SystemUtil
 
-
-model = init_chat_model(
-    model=SystemUtil.CONFIG.model_qwen_name,
-    model_provider="qwen",
-    temperature=0
-)
-
-
-# Define tools
-@tool
-def multiply(a: int, b: int) -> int:
-    """Multiply `a` and `b`.
-
-    Args:
-        a: First int
-        b: Second int
-    """
-    return a * b
+SYSTEM_PROMPT = """You are an expert website researcher and summarizer.
+Use the website extraction tools to retrieve actual page text, then summarize the content accurately.
+If the page contains many sections, provide a concise summary and list the most important points.
+Do not invent facts; if the page content cannot be fully retrieved, say so clearly.
+"""
 
 
 @tool
-def add(a: int, b: int) -> int:
-    """Adds `a` and `b`.
-
-    Args:
-        a: First int
-        b: Second int
-    """
-    return a + b
-
-
-@tool
-def divide(a: int, b: int) -> float:
-    """Divide `a` and `b`.
-
-    Args:
-        a: First int
-        b: Second int
-    """
-    return a / b
-
-
-# Augment the LLM with tools
-tools = [add, multiply, divide]
-tools_by_name = {tool.name: tool for tool in tools}
-model_with_tools = model.bind_tools(tools)
-
-# Step 2: Define state
-
-from langchain.messages import AnyMessage
-from typing_extensions import TypedDict, Annotated
-import operator
-
-
-class MessagesState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    llm_calls: int
-
-# Step 3: Define model node
-from langchain.messages import SystemMessage
-
-
-def llm_call(state: MessagesState):
-    """LLM decides whether to call a tool or not"""
-
-    return {
-        "messages": [
-            model_with_tools.invoke(
-                [
-                    SystemMessage(
-                        content="You are a helpful assistant tasked with performing arithmetic on a set of inputs."
-                    )
-                ]
-                + state["messages"]
+async def fetch_website_text(url: str) -> str:
+    """Fetch rendered website text using Playwright."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+            await page.set_user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
             )
-        ],
-        "llm_calls": state.get('llm_calls', 0) + 1
-    }
+            await page.goto(url, wait_until="networkidle", timeout=1000 * 60)
+            await page.wait_for_timeout(1500)
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(800)
+            body_text = await page.inner_text("body")
+            return body_text
+        except Exception as exc:
+            return f"Error fetching website text: {exc}"
+        finally:
+            await browser.close()
 
 
-# Step 4: Define tool node
+async def run_agent():
+    # url = "https://baike.baidu.com/item/%E9%9F%A9%E4%BF%A1/5321"
+    url = "https://walnuttree.xyz/"
+    # url = "https://developers.llamaindex.ai/python/framework/use_cases/chatbots/"
+    # url = "https://react.dev/"
+    # url = "https://docs.astral.sh/uv/guides/tools/#installing-tools"
 
-from langchain.messages import ToolMessage
+    print("Starting async website summarization agent...")
+    print("Using model:", SystemUtil.CONFIG.model_qwen_model_name)
 
+    llm = ChatOpenAI(
+        model=SystemUtil.CONFIG.model_qwen_model_name,
+        api_key=SystemUtil.CONFIG.model_qwen_api_key,
+        base_url=SystemUtil.CONFIG.model_qwen_base_url,
+        temperature=0.2,
+    )
 
-def tool_node(state: MessagesState):
-    """Performs the tool call"""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=browser)
+        tools = toolkit.get_tools() + [fetch_website_text]
 
-    result = []
-    for tool_call in state["messages"][-1].tool_calls:
-        tool = tools_by_name[tool_call["name"]]
-        observation = tool.invoke(tool_call["args"])
-        result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
-    return {"messages": result}
+        agent = create_deep_agent(
+            model=llm,
+            tools=tools,
+            system_prompt=SYSTEM_PROMPT,
+        )
 
-# Step 5: Define logic to determine whether to end
+        user_prompt = (
+            f"Retrieve and summarize the website content from the URL: {url}. "
+            "Use the available browser tools and the fetch_website_text tool to inspect the page and provide a concise, accurate summary."
+        )
 
-from typing import Literal
-from langgraph.graph import StateGraph, START, END
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_prompt}]}
+        )
+        final_message = result["messages"][-1].content
+        print("\n=== Website Summary ===\n")
+        print(final_message)
+        return final_message
 
+    agent = create_deep_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=SYSTEM_PROMPT,
+    )
 
-# Conditional edge function to route to the tool node or end based upon whether the LLM made a tool call
-def should_continue(state: MessagesState) -> Literal["tool_node", END]:
-    """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
+    user_prompt = (
+        f"Retrieve and summarize the website content from the URL: {url}. "
+        "Use the available browser tools and the fetch_website_text tool to inspect the page and provide a concise, accurate summary."
+    )
 
-    messages = state["messages"]
-    last_message = messages[-1]
+    try:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_prompt}]}
+        )
+        final_message = result["messages"][-1].content
+        print("\n=== Website Summary ===\n")
+        print(final_message)
+        return final_message
+    finally:
+        await browser.close()
 
-    # If the LLM makes a tool call, then perform an action
-    if last_message.tool_calls:
-        return "tool_node"
-
-    # Otherwise, we stop (reply to the user)
-    return END
-
-# Step 6: Build agent
-
-# Build workflow
-agent_builder = StateGraph(MessagesState)
-
-# Add nodes
-agent_builder.add_node("llm_call", llm_call)
-agent_builder.add_node("tool_node", tool_node)
-
-# Add edges to connect nodes
-agent_builder.add_edge(START, "llm_call")
-agent_builder.add_conditional_edges(
-    "llm_call",
-    should_continue,
-    ["tool_node", END]
-)
-agent_builder.add_edge("tool_node", "llm_call")
-
-# Compile the agent
-agent = agent_builder.compile()
-
-
-from IPython.display import Image, display
-# Show the agent
-display(Image(agent.get_graph(xray=True).draw_mermaid_png()))
-
-# Invoke
-from langchain.messages import HumanMessage
-messages = [HumanMessage(content="Add 3 and 4.")]
-messages = agent.invoke({"messages": messages})
-for m in messages["messages"]:
-    m.pretty_print()
-
-def run_agent():
-    print("Hello from Agent 1!")
