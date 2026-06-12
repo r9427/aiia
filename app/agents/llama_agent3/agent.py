@@ -14,7 +14,7 @@ tavily_tool = TavilyToolSpec(api_key=SystemUtil.CONFIG.tools_tavily_api_key)
 
 # 全局设置 Qwen Embedding 模型
 Settings.embed_model = DashScopeEmbedding(
-    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,  # 千问轻量级嵌入模型，性价比高
+    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,
     api_key=SystemUtil.CONFIG.model_qwen_api_key,
     timeout=30                       # 防止网络超时
 )
