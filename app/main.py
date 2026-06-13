@@ -12,12 +12,16 @@ from agents.llama_agent3.entry import run as run_agent
 
 
 async def run_app():
+    print("Use model: '{}'".format(
+        SystemUtil.CONFIG.model_qwen_model_name
+    ))
+
     await run_agent()
 
 async def main():
 
     useSelfHostedModel = False
-    
+
     if useSelfHostedModel:
         proxy_server, proxy_base_url, model_name, api_key = start_compat_proxy()
         SystemUtil.CONFIG.model_qwen_base_url = proxy_base_url
@@ -25,11 +29,7 @@ async def main():
         SystemUtil.CONFIG.model_qwen_api_key = api_key
 
         try:
-            # base_path = Util.get_base_path("startup.sh")
-            # print(f"Base path: {base_path}")
-
             await run_app()
-        
         finally:
             proxy_server.shutdown()
             proxy_server.server_close()

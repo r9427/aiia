@@ -36,11 +36,6 @@ backend = LocalShellBackend(
 
 async def get_agent():
 
-    print("qwen model config name='{}', api_key='{}', base_url='{}'".format(
-        SystemUtil.CONFIG.model_qwen_model_name,
-        SystemUtil.CONFIG.model_qwen_api_key,
-        SystemUtil.CONFIG.model_qwen_base_url
-    ))
     llm = ChatOpenAI(
         model=SystemUtil.CONFIG.model_qwen_model_name,
         api_key=SystemUtil.CONFIG.model_qwen_api_key,

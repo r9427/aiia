@@ -43,7 +43,6 @@ async def run_agent():
     # url = "https://docs.astral.sh/uv/guides/tools/#installing-tools"
 
     print("Starting async website summarization agent...")
-    print("Using model:", SystemUtil.CONFIG.model_qwen_model_name)
 
     llm = ChatOpenAI(
         model=SystemUtil.CONFIG.model_qwen_model_name,
