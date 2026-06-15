@@ -3,12 +3,14 @@ from util.SystemUtil import SystemUtil
 from proxy_server import start_compat_proxy
 from util.Util import Util
 
-# from agents.agent1.entry import run as run_agent
-# from agents.agent2.entry import run as run_agent
-# from agents.agent3.entry import run as run_agent
+# from agents.chart_agent.entry import run as run_agent
+from agents.chat_agent.entry import run as run_agent
+# from agents.crawler_agent.entry import run as run_agent
+# from agents.human_agent.entry import run as run_agent
+# from agents.internal_search_agent1.entry import run as run_agent
+# from agents.internal_search_agent2.entry import run as run_agent
 # from agents.llama_agent1.entry import run as run_agent
 # from agents.llama_agent2.entry import run as run_agent
-from agents.llama_agent3.entry import run as run_agent
 
 
 async def run_app():

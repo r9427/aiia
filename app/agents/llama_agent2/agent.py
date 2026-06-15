@@ -1,16 +1,20 @@
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
-from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.core.agent.workflow import FunctionAgent, AgentStream
 from llama_index.core.workflow import Context
 from llama_index.embeddings.dashscope import DashScopeEmbedding
+
+from llama_index.tools.tavily_research import TavilyToolSpec
 
 from util.SystemUtil import SystemUtil
 
 
+tavily_tool = TavilyToolSpec(api_key=SystemUtil.CONFIG.tools_tavily_api_key)
+
 # 全局设置 Qwen Embedding 模型
 Settings.embed_model = DashScopeEmbedding(
-    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,  # 千问轻量级嵌入模型，性价比高
+    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,
     api_key=SystemUtil.CONFIG.model_qwen_api_key,
     timeout=30                       # 防止网络超时
 )
@@ -41,6 +45,7 @@ async def set_name(ctx: Context, name: str) -> str:
     return f"Name set to {name}"
 
 async def run_agent():
+
     llm = OpenAILike(
         model=SystemUtil.CONFIG.model_qwen_model_name,
         api_base=SystemUtil.CONFIG.model_qwen_base_url,
@@ -52,9 +57,9 @@ async def run_agent():
 
     # Create an agent workflow with our calculator tool
     agent = FunctionAgent(
-        tools=[multiply, add, set_name],
+        tools=tavily_tool.to_tool_list(),
         llm=llm,
-        system_prompt="You are an agent that can perform basic mathematical operations using tools. You can set a name.",
+        system_prompt="You are an agent that can perform basic mathematical operations using tools. You can set a name. You can search web for information.",
         initial_state={"name": "unset"}
     )
 
@@ -64,19 +69,12 @@ async def run_agent():
     # response = await agent.run(ctx=ctx, user_msg="My name is Logan")
 
     user_msgs = [
-        # "What is 20+(2*4)?",
-        "What's my initial name ?",
-        "My name is Locke !",
-        "What's my name again ?"
+        "What's the weather like in Shanghai ?"
     ]
+    handler = agent.run(ctx=ctx, user_msg=user_msgs[0])
 
-    for index, msg in enumerate(user_msgs):
-        response = await agent.run(ctx=ctx, user_msg=msg)
-        state = await ctx.store.get("state")
-        print(f"============= Round {index + 1} =================")
-        print(f"User: {msg}")
-        print(response)
-        print(f"name = ({state['name']})")
+    async for event in handler.stream_events():
+        if isinstance(event, AgentStream):
+            print(event.delta, end="", flush=True)
 
-    print("============= End =================")
     
