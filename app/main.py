@@ -22,9 +22,9 @@ async def run_app():
 
 async def main():
 
-    useSelfHostedModel = False
+    use_self_hosted_model = False
 
-    if useSelfHostedModel:
+    if use_self_hosted_model:
         proxy_server, proxy_base_url, model_name, api_key = start_compat_proxy()
         SystemUtil.CONFIG.model_qwen_base_url = proxy_base_url
         SystemUtil.CONFIG.model_qwen_model_name = model_name
