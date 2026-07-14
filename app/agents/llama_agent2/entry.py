@@ -1,4 +1,4 @@
-from agents.llama_agent3.agent import run_agent
+from agents.llama_agent2.agent import run_agent
 
 
 async def run():

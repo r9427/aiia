@@ -1,4 +1,4 @@
-from agents.agent1.agent import run_agent
+from agents.crawler_agent.agent import run_agent
 
 
 async def run():

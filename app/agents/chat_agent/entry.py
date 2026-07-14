@@ -1,4 +1,4 @@
-from agents.agent2.agent import run_agent
+from agents.chat_agent.agent import run_agent
 
 
 async def run():

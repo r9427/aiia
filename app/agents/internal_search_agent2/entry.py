@@ -1,4 +1,4 @@
-from agents.agent4.agent import run_agent
+from agents.internal_search_agent2.agent import run_agent
 
 
 async def run():
