@@ -1,3 +1,4 @@
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,3 +28,8 @@ class Util(object):
         if result and type(result) == str:
             result = result.strip()
         return result
+
+    @staticmethod
+    def remove_dir(target_path: Path):
+        if target_path.exists():
+            shutil.rmtree(target_path)
