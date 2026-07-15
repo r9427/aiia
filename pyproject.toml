@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "asyncmy>=0.2.11",
+    "asyncpg>=0.31.0",
     "beautifulsoup4>=4.15.0",
     "deepagents>=0.6.8",
     "greenlet>=3.5.1",
@@ -12,13 +14,17 @@ dependencies = [
     "langchain-openai>=1.2.2",
     "langgraph>=1.2.4",
     "langsmith>=0.8.9",
-    "llama-index>=0.14.22",
+    "llama-index>=0.14.23",
     "llama-index-embeddings-dashscope>=0.5.0",
     "llama-index-llms-openai-like>=0.7.2",
     "llama-index-tools-tavily-research>=0.5.0",
+    "llama-index-utils-workflow>=0.11.0",
     "lxml>=6.1.1",
     "milvus-lite>=3.0",
+    "pandas>=3.0.3",
     "playwright>=1.60.0",
     "pymilvus[milvus-lite,model]>=3.0.0",
+    "pymysql>=1.2.0",
     "requests>=2.34.2",
+    "sqlalchemy>=2.0.50",
 ]
