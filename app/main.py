@@ -16,7 +16,7 @@ from agents.text_2_sql.entry import run as run_agent
 
 async def run_app():
     print("Use model: '{}'".format(
-        SystemUtil.CONFIG.model_qwen_model_name
+        SystemUtil.CONFIG.model_name
     ))
 
     await run_agent()
@@ -27,9 +27,9 @@ async def main():
 
     if use_self_hosted_model:
         proxy_server, proxy_base_url, model_name, api_key = start_compat_proxy()
-        SystemUtil.CONFIG.model_qwen_base_url = proxy_base_url
-        SystemUtil.CONFIG.model_qwen_model_name = model_name
-        SystemUtil.CONFIG.model_qwen_api_key = api_key
+        SystemUtil.CONFIG.model_base_url = proxy_base_url
+        SystemUtil.CONFIG.model_name = model_name
+        SystemUtil.CONFIG.model_api_key = api_key
 
         try:
             await run_app()

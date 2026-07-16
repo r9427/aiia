@@ -47,9 +47,9 @@ Settings.embed_model = DashScopeEmbedding(
 
 # 配置全局 LLM 为 Qwen
 Settings.llm = OpenAILike(
-    model=SystemUtil.CONFIG.model_qwen_model_name,
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
-    api_base=SystemUtil.CONFIG.model_qwen_base_url,
+    model=SystemUtil.CONFIG.model_name,
+    api_key=SystemUtil.CONFIG.model_api_key,
+    api_base=SystemUtil.CONFIG.model_base_url,
     is_chat_model=True,
     is_function_calling_model=True
 )
@@ -69,12 +69,10 @@ db_url = SystemUtil.CONFIG.get_mysql_url()
 engine = create_engine(db_url)
 sql_database = SQLDatabase(engine)
 
-dfs = []
-
 llm = OpenAILike(
-    model=SystemUtil.CONFIG.model_qwen_model_name,
-    api_base=SystemUtil.CONFIG.model_qwen_base_url,
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
+    model=SystemUtil.CONFIG.model_name,
+    api_base=SystemUtil.CONFIG.model_base_url,
+    api_key=SystemUtil.CONFIG.model_api_key,
     context_window=128000,
     is_chat_model=True,
     is_function_calling_model=True,
@@ -143,7 +141,7 @@ class TextToSQLWorkflow1(Workflow):
 
     def __init__(
         self,
-        table_schema_objs,
+        obj_retriever,
         text2sql_prompt,
         sql_retriever,
         response_synthesis_prompt,
@@ -153,7 +151,7 @@ class TextToSQLWorkflow1(Workflow):
     ) -> None:
         """Init params."""
         super().__init__(*args, **kwargs)
-        self.table_schema_objs = table_schema_objs
+        self.obj_retriever = obj_retriever
         self.text2sql_prompt = text2sql_prompt
         self.sql_retriever = sql_retriever
         self.response_synthesis_prompt = response_synthesis_prompt
@@ -163,14 +161,9 @@ class TextToSQLWorkflow1(Workflow):
     def retrieve_tables(
         self, ctx: Context, ev: StartEvent
     ) -> TableRetrieveEvent:
-        """Retrieve relevant tables dynamically for the current query."""
-        selected_tables = _select_table_schema_objs(
-            query=ev.query,
-            table_schema_objs=self.table_schema_objs,
-            selector_llm=self.llm,
-            top_k=3,
-        )
-        table_context_str = get_table_context_str(selected_tables)
+        """Retrieve tables."""
+        table_schema_objs = self.obj_retriever.retrieve(ev.query)
+        table_context_str = get_table_context_str(table_schema_objs)
         return TableRetrieveEvent(
             table_context_str=table_context_str, query=ev.query
         )
@@ -196,7 +189,7 @@ class TextToSQLWorkflow1(Workflow):
             context_str=str(retrieved_rows),
             query_str=ev.query,
         )
-        chat_response = llm.chat(fmt_messages)
+        chat_response = self.llm.chat(fmt_messages)
         return StopEvent(result=chat_response)
 
 output_dir = SystemUtil.OUTPUT_DIR
@@ -205,6 +198,7 @@ tableinfo_path = output_dir.joinpath(tableinfo_dir)
 Util.remove_dir(tableinfo_path)
 tableinfo_path.mkdir(parents=True, exist_ok=True)
 
+dfs = []
 
 def get_data():
 
@@ -234,7 +228,7 @@ def get_data():
     for table_name, sql in sql_items:
         with engine.connect() as connection:
             df = pd.read_sql(sql, connection)
-        dfs.append((table_name, df))
+        dfs.append(df)
 
     # for row in rows:
     #     print(row)
@@ -356,33 +350,38 @@ async def run_agent():
 
     
 
+    table_names = set()
     table_infos = []
-    for idx, (db_table_name, df) in enumerate(dfs):
+    for idx, df in enumerate(dfs):
         table_info = _get_tableinfo_with_index(idx)
-        if table_info is None:
+        if table_info:
+            table_infos.append(table_info)
+        else:
             while True:
                 df_str = df.head(10).to_csv()
-                table_info = _predict_table_info(
+                table_info = llm.structured_predict(
+                    TableInfo,
                     prompt_tmpl,
                     table_str=df_str,
-                    exclude_table_name_list="[]",
+                    exclude_table_name_list=str(list(table_names)),
                 )
-
-                if table_info.table_summary and table_info.table_summary.strip():
+                table_name = table_info.table_name
+                print(f"Processed table: {table_name}")
+                if table_name not in table_names:
+                    table_names.add(table_name)
                     break
+                else:
+                    # try again
+                    print(f"Table name {table_name} already exists, trying again.")
+                    pass
 
             # out_file = f"{tableinfo_dir}/{idx}_{table_name}.json"
             out_file = f"{idx}_{db_table_name}.json"
             # tableinfo_path.joinpath(out_file).write_text(table_info.model_dump_json(indent=4))
             output_path = tableinfo_path.joinpath(out_file)
-
-            # Always bind to a real DB table name to avoid NoSuchTableError.
-            table_info.table_name = db_table_name
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(table_info.model_dump(), f)
 
-        # ensure cached data also uses actual DB table names
-        table_info.table_name = db_table_name
         table_infos.append(table_info)
     
     # print("********** Start ************")
@@ -396,10 +395,17 @@ async def run_agent():
     # if test:
     #     return
 
+    table_node_mapping = SQLTableNodeMapping(sql_database)
     table_schema_objs = [
         SQLTableSchema(table_name=t.table_name, context_str=t.table_summary)
         for t in table_infos
     ]  # add a SQLTableSchema for each table
+    obj_index = ObjectIndex.from_objects(
+        table_schema_objs,
+        table_node_mapping,
+        VectorStoreIndex,
+    )
+    obj_retriever = obj_index.as_retriever(similarity_top_k=3)
 
     sql_retriever = SQLRetriever(sql_database)
     
@@ -434,7 +440,7 @@ async def run_agent():
 
     # run some queries
     workflow = TextToSQLWorkflow1(
-        table_schema_objs,
+        obj_retriever,
         text2sql_prompt,
         sql_retriever,
         response_synthesis_prompt,
@@ -445,7 +451,7 @@ async def run_agent():
 
 
     queries = [
-        "list tickets created to yiming",
+        "list tickets created by yiming",
         "list tickets assigned to yiming",
     ]
     response = await workflow.run(

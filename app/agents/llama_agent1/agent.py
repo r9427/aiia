@@ -17,9 +17,9 @@ Settings.embed_model = DashScopeEmbedding(
 
 # 配置全局 LLM 为 Qwen
 Settings.llm = OpenAILike(
-    model=SystemUtil.CONFIG.model_qwen_model_name,
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
-    api_base=SystemUtil.CONFIG.model_qwen_base_url,
+    model=SystemUtil.CONFIG.model_name,
+    api_key=SystemUtil.CONFIG.model_api_key,
+    api_base=SystemUtil.CONFIG.model_base_url,
     is_chat_model=True,
     is_function_calling_model=True
 )
@@ -42,9 +42,9 @@ async def set_name(ctx: Context, name: str) -> str:
 
 async def run_agent():
     llm = OpenAILike(
-        model=SystemUtil.CONFIG.model_qwen_model_name,
-        api_base=SystemUtil.CONFIG.model_qwen_base_url,
-        api_key=SystemUtil.CONFIG.model_qwen_api_key,
+        model=SystemUtil.CONFIG.model_name,
+        api_base=SystemUtil.CONFIG.model_base_url,
+        api_key=SystemUtil.CONFIG.model_api_key,
         context_window=128000,
         is_chat_model=True,
         is_function_calling_model=True,

@@ -1,34 +1,31 @@
 from deepagents import create_deep_agent
 from langchain_core.tools import Tool
 from langchain_openai import ChatOpenAI
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex
+
+from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.core.workflow import Context
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.openai_like import OpenAILike
-from llama_index.core.workflow import Context
-
-from llama_index.core import Settings
 from llama_index.embeddings.dashscope import DashScopeEmbedding
+from llama_index.embeddings.openai import OpenAIEmbedding
 
 from util.SystemUtil import SystemUtil
 
 
-# SystemUtil.CONFIG.model_qwen_model_name,
-#         SystemUtil.CONFIG.model_qwen_api_key,
-#     SystemUtil.CONFIG.model_qwen_base_url
-
 # 全局设置 Qwen Embedding 模型
-Settings.embed_model = DashScopeEmbedding(
-    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,  # 千问轻量级嵌入模型，性价比高
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
+Settings.embed_model = OpenAIEmbedding(
+    model_name=SystemUtil.CONFIG.model_embedding_name,  # 千问轻量级嵌入模型，性价比高
+    api_base=SystemUtil.CONFIG.model_base_url,
+    api_key=SystemUtil.CONFIG.model_api_key,
     timeout=30                       # 防止网络超时
 )
 
 # 配置全局 LLM 为 Qwen
 Settings.llm = OpenAILike(
-    model=SystemUtil.CONFIG.model_qwen_model_name,
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
-    api_base=SystemUtil.CONFIG.model_qwen_base_url,
+    model=SystemUtil.CONFIG.model_name,
+    api_key=SystemUtil.CONFIG.model_api_key,
+    api_base=SystemUtil.CONFIG.model_base_url,
     is_chat_model=True,
     is_function_calling_model=True
 )
@@ -45,7 +42,7 @@ Settings.llm = OpenAILike(
 # query_engine = index.as_query_engine()
 
 # Create a RAG tool using LlamaIndex
-docs_path = SystemUtil.BASE_DIR.joinpath("app", "agents", "agent4", "docs")
+docs_path = SystemUtil.BASE_DIR.joinpath("app", "agents", "internal_search_agent2", "docs")
 docs_path.mkdir(exist_ok=True)
 documents = SimpleDirectoryReader(docs_path).load_data()
 # print(f"成功加载 {len(documents)} 个文档")
@@ -80,18 +77,18 @@ def rag_search(query: str) -> str:
 async def run_agent():
 
     # llm = OpenAILike(
-    #     model=SystemUtil.CONFIG.model_qwen_model_name,
-    #     api_base=SystemUtil.CONFIG.model_qwen_base_url,
-    #     api_key=SystemUtil.CONFIG.model_qwen_api_key,
+    #     model=SystemUtil.CONFIG.model_name,
+    #     api_base=SystemUtil.CONFIG.model_base_url,
+    #     api_key=SystemUtil.CONFIG.model_api_key,
     #     context_window=128000,
     #     is_chat_model=True,
     #     is_function_calling_model=True,
     # )
 
     llm2 = ChatOpenAI(
-        model=SystemUtil.CONFIG.model_qwen_model_name,
-        api_key=SystemUtil.CONFIG.model_qwen_api_key,
-        base_url=SystemUtil.CONFIG.model_qwen_base_url
+        model=SystemUtil.CONFIG.model_name,
+        api_key=SystemUtil.CONFIG.model_api_key,
+        base_url=SystemUtil.CONFIG.model_base_url
     )
 
     # Create an agent workflow with our calculator tool

@@ -37,9 +37,9 @@ backend = LocalShellBackend(
 async def get_agent():
 
     llm = ChatOpenAI(
-        model=SystemUtil.CONFIG.model_qwen_model_name,
-        api_key=SystemUtil.CONFIG.model_qwen_api_key,
-        base_url=SystemUtil.CONFIG.model_qwen_base_url
+        model=SystemUtil.CONFIG.model_name,
+        api_key=SystemUtil.CONFIG.model_api_key,
+        base_url=SystemUtil.CONFIG.model_base_url
     )
 
     visualizer: AsyncSubAgent = {

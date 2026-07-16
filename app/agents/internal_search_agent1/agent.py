@@ -10,10 +10,6 @@ from llama_index.embeddings.dashscope import DashScopeEmbedding
 from util.SystemUtil import SystemUtil
 
 
-# SystemUtil.CONFIG.model_qwen_model_name,
-#         SystemUtil.CONFIG.model_qwen_api_key,
-#     SystemUtil.CONFIG.model_qwen_base_url
-
 # 全局设置 Qwen Embedding 模型
 Settings.embed_model = DashScopeEmbedding(
     model_name=SystemUtil.CONFIG.model_qwen_embedding_name,  # 千问轻量级嵌入模型，性价比高
@@ -23,9 +19,9 @@ Settings.embed_model = DashScopeEmbedding(
 
 # 配置全局 LLM 为 Qwen
 Settings.llm = OpenAILike(
-    model=SystemUtil.CONFIG.model_qwen_model_name,
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
-    api_base=SystemUtil.CONFIG.model_qwen_base_url,
+    model=SystemUtil.CONFIG.model_name,
+    api_key=SystemUtil.CONFIG.model_api_key,
+    api_base=SystemUtil.CONFIG.model_base_url,
     is_chat_model=True,
     is_function_calling_model=True
 )
@@ -66,9 +62,9 @@ async def search_documents(query: str) -> str:
 async def run_agent():
 
     llm = OpenAILike(
-        model=SystemUtil.CONFIG.model_qwen_model_name,
-        api_base=SystemUtil.CONFIG.model_qwen_base_url,
-        api_key=SystemUtil.CONFIG.model_qwen_api_key,
+        model=SystemUtil.CONFIG.model_name,
+        api_base=SystemUtil.CONFIG.model_base_url,
+        api_key=SystemUtil.CONFIG.model_api_key,
         context_window=128000,
         is_chat_model=True,
         is_function_calling_model=True,
