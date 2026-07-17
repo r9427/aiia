@@ -10,7 +10,7 @@ from llama_index.core.workflow import (
     InputRequiredEvent,
     HumanResponseEvent,
 )
-from llama_index.embeddings.dashscope import DashScopeEmbedding
+from llama_index.embeddings.openai import OpenAIEmbedding
 
 from llama_index.tools.tavily_research import TavilyToolSpec
 
@@ -20,10 +20,11 @@ from util.SystemUtil import SystemUtil
 tavily_tool = TavilyToolSpec(api_key=SystemUtil.CONFIG.tools_tavily_api_key)
 
 # 全局设置 Qwen Embedding 模型
-Settings.embed_model = DashScopeEmbedding(
-    model_name=SystemUtil.CONFIG.model_qwen_embedding_name,  # 千问轻量级嵌入模型，性价比高
-    api_key=SystemUtil.CONFIG.model_qwen_api_key,
-    timeout=30                       # 防止网络超时
+Settings.embed_model = OpenAIEmbedding(
+    model_name=SystemUtil.CONFIG.model_embedding_name,
+    api_base=SystemUtil.CONFIG.model_base_url,
+    api_key=SystemUtil.CONFIG.model_api_key,
+    timeout=30,                      # 防止网络超时
 )
 
 # 配置全局 LLM 为 Qwen

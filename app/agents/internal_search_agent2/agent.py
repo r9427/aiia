@@ -7,7 +7,6 @@ from llama_index.core.agent.workflow import FunctionAgent
 from llama_index.core.workflow import Context
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.openai_like import OpenAILike
-from llama_index.embeddings.dashscope import DashScopeEmbedding
 from llama_index.embeddings.openai import OpenAIEmbedding
 
 from util.SystemUtil import SystemUtil
