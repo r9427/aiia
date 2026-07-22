@@ -1,0 +1,14 @@
+services:
+  qdrant_db:
+    image: qdrant/qdrant
+    volumes:
+      - qdrant_vol:/qdrant/storage:z
+    ports:
+      - 127.0.0.1:6333:6333
+      - 127.0.0.1:6334:6334
+    environment:
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_DATABASE: todos
+
+volumes:
+  qdrant_vol:
