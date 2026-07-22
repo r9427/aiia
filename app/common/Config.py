@@ -26,7 +26,13 @@ class Config(object):
         self.mysql_name = Util.strip_string(os.getenv("MYSQL_NAME", None) or parser['mysql']['name'])
         self.mysql_username = Util.strip_string(os.getenv("MYSQL_USERNAME", None) or parser['mysql']['username'])
         self.mysql_password = Util.strip_string(os.getenv("MYSQL_PASSWORD", None) or parser['mysql']['password'])
+        self.qdrant_host = Util.strip_string(os.getenv("QDRANT_HOST", None) or parser['qdrant']['host'])
+        self.qdrant_port = int(Util.strip_string(os.getenv("QDRANT_PORT", None) or parser['qdrant']['port']))
         self.tools_tavily_api_key = Util.strip_string(os.getenv("TOOLS_TAVILY_API_KEY", None) or parser['tools']['tavily_api_key'])
+
+    def get_db_url(self):
+        # return self.get_pg_url()
+        return self.get_mysql_url()
 
     def get_pg_url(self):
         return Template(

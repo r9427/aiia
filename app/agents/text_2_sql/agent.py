@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import json
 import os
@@ -20,7 +21,7 @@ from llama_index.core.workflow import (
     Event,
 )
 
-from llama_index.core.objects import SQLTableSchema
+from llama_index.core.objects import SQLTableSchema, SQLTableNodeMapping, ObjectIndex
 from llama_index.core.prompts import ChatPromptTemplate
 from llama_index.core.prompts.default_prompts import DEFAULT_TEXT_TO_SQL_PROMPT
 from llama_index.core.llms import ChatMessage, ChatResponse
@@ -58,8 +59,13 @@ Settings.llm = OpenAILike(
     is_function_calling_model=True
 )
 
+vector_table_prefix = "car_"
 
-db_url = SystemUtil.CONFIG.get_mysql_url()
+def get_vector_table_name(name: str) -> str:
+    return f"{vector_table_prefix}{name}"
+
+
+db_url = SystemUtil.CONFIG.get_db_url()
 # engine = create_async_engine(
 #     db_url,
 #     pool_size=20,
@@ -117,7 +123,7 @@ def _extract_json_block(text: str) -> str:
     return content[left : right + 1]
 
 
-def _predict_table_info(db_table_name: str, prompt_tmpl: ChatPromptTemplate, table_str: str, exclude_table_name_list: str) -> TableInfo:
+def _predict_table_info(ref_table_name: str, prompt_tmpl: ChatPromptTemplate, table_str: str, exclude_table_name_list: str) -> TableInfo:
     """Predict table info; prefer structured_predict, then fallback to chat JSON parsing."""
     try:
         structured_llm = OpenAILike(
@@ -137,7 +143,7 @@ def _predict_table_info(db_table_name: str, prompt_tmpl: ChatPromptTemplate, tab
         )
         if not isinstance(structured_result, TableInfo):
             structured_result = TableInfo.model_validate(structured_result)
-        return structured_result.model_copy(update={"db_table_name": db_table_name})
+        return structured_result.model_copy(update={"ref_table_name": ref_table_name})
     except Exception as e:
         messages = prompt_tmpl.format_messages(
             table_str=table_str,
@@ -150,7 +156,7 @@ def _predict_table_info(db_table_name: str, prompt_tmpl: ChatPromptTemplate, tab
         if not isinstance(data, dict):
             raise ValueError(f"Table summary response must be a JSON object, got: {type(data)}")
         # Always take the true DB table name from code, not model output.
-        data["db_table_name"] = db_table_name
+        data["ref_table_name"] = ref_table_name
         result = TableInfo.model_validate(data)
         return result
 
@@ -224,7 +230,7 @@ def _build_table_str_for_prompt(table_name: str, rows: List[tuple], columns: Lis
 class TableInfo(BaseModel):
     """Information regarding a structured table."""
 
-    db_table_name: str | None = Field(
+    ref_table_name: str | None = Field(
         None, description="db table name (original name in database, must be the same as in db)"
     )
     table_name: str = Field(
@@ -253,8 +259,10 @@ class TextToSQLWorkflow1(Workflow):
 
     def __init__(
         self,
-        table_schema_objs,
+        obj_retriever,
+        # table_schema_objs,
         text2sql_prompt,
+        vector_index_dict,
         sql_retriever,
         response_synthesis_prompt,
         llm,
@@ -264,8 +272,10 @@ class TextToSQLWorkflow1(Workflow):
     ) -> None:
         """Init params."""
         super().__init__(*args, **kwargs)
-        self.table_schema_objs = table_schema_objs
+        self.obj_retriever = obj_retriever
+        # self.table_schema_objs = table_schema_objs
         self.text2sql_prompt = text2sql_prompt
+        self.vector_index_dict = vector_index_dict
         self.sql_retriever = sql_retriever
         self.response_synthesis_prompt = response_synthesis_prompt
         self.llm = llm
@@ -276,12 +286,13 @@ class TextToSQLWorkflow1(Workflow):
         self, ctx: Context, ev: StartEvent
     ) -> TableRetrieveEvent:
         """Retrieve tables."""
-        table_schema_objs = _select_table_schema_objs(
-            ev.query,
-            self.table_schema_objs,
-            self.llm,
-            top_k=self.selector_top_k,
-        )
+        # table_schema_objs = _select_table_schema_objs(
+        #     ev.query,
+        #     self.table_schema_objs,
+        #     self.llm,
+        #     top_k=self.selector_top_k,
+        # )
+        table_schema_objs = self.obj_retriever.retrieve(ev.query)
         table_context_str = get_table_context_str(table_schema_objs)
         return TableRetrieveEvent(
             table_context_str=table_context_str, query=ev.query
@@ -332,9 +343,9 @@ class TextToSQLWorkflow2(TextToSQLWorkflow1):
         self, ctx: Context, ev: StartEvent
     ) -> TableRetrieveEvent:
         """Retrieve tables."""
-        table_schema_objs = self.table_schema_objs
+        table_schema_objs = self.obj_retriever.retrieve(ev.query)
         table_context_str = get_table_context_and_rows_str(
-            ev.query, table_schema_objs, verbose=self._verbose
+            ev.query, table_schema_objs, self.vector_index_dict, verbose=self._verbose
         )
         return TableRetrieveEvent(
             table_context_str=table_context_str, query=ev.query
@@ -496,52 +507,60 @@ def _select_table_schema_objs(
     # Fallback: keep behavior flexible and safe if selector output is malformed.
     return table_schema_objs
 
-def index_all_tables(
-    sql_database: SQLDatabase, table_index_dir: str = "output"
+async def index_all_tables2(
+    sql_database: SQLDatabase
 ) -> Dict[str, VectorStoreIndex]:
     vector_index_dict = {}
     engine = sql_database.engine
     identifier_preparer = engine.dialect.identifier_preparer
 
-
-    client = QdrantClient (
-        host="localhost",
-        port=6333
+    client = QdrantClient(
+        host=SystemUtil.CONFIG.qdrant_host,
+        port=SystemUtil.CONFIG.qdrant_port,
+        timeout=10000
     )
-
     aclient = AsyncQdrantClient(
-        host="localhost",
-        port=6333
+        host=SystemUtil.CONFIG.qdrant_host,
+        port=SystemUtil.CONFIG.qdrant_port,
+        timeout=10000
     )
 
-    vector_store = QdrantVectorStore(
-        collection_name=qdrant_collection,
-        client=client,
-        aclient=aclient,
-        prefer_grpc=True,
-        enable_hybrid=True,
-        fastembed_sparse_model="Qdrant/bm25",
-    )
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    init_vector_db = True  # Set to True to index all tables; False to load existing vector store indices.
+    for table_name in sql_database.get_usable_table_names():
+        vector_table_name = get_vector_table_name(table_name)
 
-    init_vector_db = False
-    if init_vector_db:
-        for table_name in sql_database.get_usable_table_names():
+        existed = client.collection_exists(collection_name=vector_table_name)
+        if existed and init_vector_db:
+            continue
+
+        vector_store = QdrantVectorStore(
+            collection_name=vector_table_name,
+            client=client,
+            aclient=aclient,
+            prefer_grpc=True,
+            enable_hybrid=True,
+            fastembed_sparse_model="Qdrant/bm25",
+        )
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+        if init_vector_db:
             print(f"Indexing rows in table: {table_name}")
+            docs = []
             with engine.connect() as conn:
                 quoted_table_name = identifier_preparer.quote_identifier(table_name)
                 cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name}"))
                 result = cursor.fetchall()
-                row_tups = []
+                # row_tups = []
                 for row in result:
-                    row_tups.append(tuple(row))
+                    # row_tups.append(tuple(row))
+                    docs.append(Document(text=str(tuple(row)), metadata={"ref_table_name": table_name}))
 
             # index each row, put into vector store index
-            docs = [Document(text=str(t)) for t in row_tups]
+            # docs = [Document(text=str(t)) for t in row_tups]
 
             # put into vector store index (may fail if embedding provider returns invalid vectors)
             try:
-                index = VectorStoreIndex.from_documents(
+                vector_index_dict[table_name] = VectorStoreIndex.from_documents(
                     documents=docs,
                     storage_context=storage_context,
                     use_async=True,
@@ -550,34 +569,141 @@ def index_all_tables(
             except Exception as exc:
                 print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
                 continue
+        else:
+            vector_index_dict[table_name] = VectorStoreIndex.from_vector_store(
+                vector_store,
+                # Embedding model should match the original embedding model
+                # embed_model=Settings.embed_model
+            )
 
-        # vector_index_dict[table_name] = index
-    else:
-        # rebuild storage context
-        print(f"Loading existing index for table")
-        # load index
-        index = VectorStoreIndex.from_vector_store(
+    return vector_index_dict
+
+async def index_all_tables(
+    sql_database: SQLDatabase
+) -> Dict[str, VectorStoreIndex]:
+    vector_index_dict = {}
+    engine = sql_database.engine
+    identifier_preparer = engine.dialect.identifier_preparer
+
+    client = QdrantClient(
+        host=SystemUtil.CONFIG.qdrant_host,
+        port=SystemUtil.CONFIG.qdrant_port,
+        timeout=10000
+    )
+    aclient = AsyncQdrantClient(
+        host=SystemUtil.CONFIG.qdrant_host,
+        port=SystemUtil.CONFIG.qdrant_port,
+        timeout=10000
+    )
+
+    init_vector_db = True  # Set to True to index all tables; False to load existing vector store indices.
+    if init_vector_db:
+        await index_db_tables(client, aclient, sql_database)
+    for table_name in sql_database.get_usable_table_names():
+        vector_table_name = get_vector_table_name(table_name)
+        vector_store = QdrantVectorStore(
+            collection_name=vector_table_name,
+            client=client,
+            aclient=aclient,
+            prefer_grpc=True,
+            enable_hybrid=True,
+            fastembed_sparse_model="Qdrant/bm25",
+        )
+        vector_index_dict[table_name] = VectorStoreIndex.from_vector_store(
             vector_store,
             # Embedding model should match the original embedding model
             # embed_model=Settings.embed_model
         )
 
-    index = VectorStoreIndex.from_vector_store(
-        vector_store,
-        # Embedding model should match the original embedding model
-        # embed_model=Settings.embed_model
-    )
-    return index
+    return vector_index_dict
 
-print("Indexing all tables started")
-vector_index_dict = index_all_tables(sql_database)
-# vector_index_dict: Dict[str, VectorStoreIndex] = {}
-print("Indexing all tables  completed")
+
+async def index_db_tables(client: QdrantClient, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
+    queue = asyncio.Queue(1000)
+    producer = asyncio.create_task(produce_queue(queue, aclient, sql_database))
+    consumers = [
+        asyncio.create_task(consume_queue(queue, client, aclient, sql_database))
+        for _ in range(40)
+    ]
+
+    try:
+        await producer
+        await queue.join()
+    finally:
+        for consumer in consumers:
+            consumer.cancel()
+        await asyncio.gather(*consumers, return_exceptions=True)
+
+async def produce_queue(queue: asyncio.Queue, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
+    for table_name in sql_database.get_usable_table_names():
+        vector_table_name = get_vector_table_name(table_name)
+        try:
+            existed = await aclient.collection_exists(collection_name=vector_table_name)
+        except Exception as exc:
+            print(f"Skip table '{table_name}' while checking collection existence: {exc}")
+            continue
+        if existed:
+            continue
+        await queue.put(table_name)
+
+async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
+    engine = sql_database.engine
+    identifier_preparer = engine.dialect.identifier_preparer
+    while True:
+        table_name = await queue.get()
+        try:
+            print(f"Indexing rows in table: {table_name}")
+            vector_table_name = get_vector_table_name(table_name)
+            vector_store = QdrantVectorStore(
+                collection_name=vector_table_name,
+                client=client,
+                aclient=aclient,
+                prefer_grpc=True,
+                enable_hybrid=True,
+                fastembed_sparse_model="Qdrant/bm25",
+            )
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+            docs = []
+            with engine.connect() as conn:
+                quoted_table_name = identifier_preparer.quote_identifier(table_name)
+                cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name}"))
+                result = cursor.fetchall()
+                for row in result:
+                    ref_id = row._mapping
+                    ref_created_at = ref_id.get("created_at", "")
+                    ref_updated_at = ref_id.get("updated_at", "")
+                    docs.append(
+                        Document(
+                            text=str(tuple(row)),
+                            metadata={
+                                "ref_table_name": table_name,
+                                "ref_id": "",
+                                "ref_created_at": "",
+                                "ref_updated_at": "",
+                            },
+                        )
+                    )
+
+            try:
+                VectorStoreIndex.from_documents(
+                    documents=docs,
+                    storage_context=storage_context,
+                    use_async=True,
+                    # embed_model=Settings.embed_model,
+                )
+            except Exception as exc:
+                print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
+        except Exception as exc:
+            print(f"Skip indexing table '{table_name}' due to runtime error: {exc}")
+        finally:
+            queue.task_done()
 
 
 def get_table_context_and_rows_str(
     query_str: str,
     table_schema_objs: List[SQLTableSchema],
+    vector_index_dict: Dict[str, VectorStoreIndex],
     verbose: bool = False,
 ):
     """Get table context string."""
@@ -592,9 +718,9 @@ def get_table_context_and_rows_str(
             table_opt_context += table_schema_obj.context_str
             table_info += table_opt_context
 
-        # also lookup vector index to return relevant table rows (optional)
-        # vector_index = vector_index_dict.get(table_schema_obj.table_name)
-        vector_index = vector_index_dict
+        # also lookup vector index to return relevant table rows
+        vector_index = vector_index_dict.get(table_schema_obj.table_name)
+        # vector_index = vector_index_dict
         if vector_index is not None:
             vector_retriever = vector_index.as_retriever(similarity_top_k=2)
             relevant_nodes = vector_retriever.retrieve(query_str)
@@ -603,33 +729,31 @@ def get_table_context_and_rows_str(
                 for node in relevant_nodes:
                     table_row_context += str(node.get_content()) + "\n"
                 table_info += table_row_context
-        elif verbose:
+        else:
             print(f"> No row index found for table: {table_schema_obj.table_name}")
 
         if verbose:
-            # print(f"> Table Info: {table_info}")
-            pass
+            print(f"> Table Info: {table_info}")
 
         context_strs.append(table_info)
     return "\n\n".join(context_strs)
 
 def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
     table_infos = []
-    init_vector_db = False
-
+    init_vector_db = True  # Set to True to index all tables; False to load existing vector store indices.
+    vector_table_name = get_vector_table_name("table_info")
 
     client = QdrantClient (
         host="localhost",
         port=6333
     )
-
     aclient = AsyncQdrantClient(
         host="localhost",
         port=6333
     )
 
     vector_store = QdrantVectorStore(
-        collection_name='table_info',
+        collection_name=vector_table_name,
         client=client,
         aclient=aclient,
         prefer_grpc=True,
@@ -678,7 +802,7 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
 
             print(f"Process table: {table_name}")
             table_info = _predict_table_info(
-                db_table_name=table_name,
+                ref_table_name=table_name,
                 prompt_tmpl=prompt_tmpl,
                 table_str=df_str,
                 exclude_table_name_list=str(list(summarized_table_names)),
@@ -692,7 +816,7 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
                 docs.append(Document(
                     text=str(table_info),
                     metadata={
-                        "db_table_name": table_info.db_table_name,
+                        "ref_table_name": table_info.ref_table_name,
                         "table_name": table_info.table_name,
                         "table_summary": table_info.table_summary
                     }
@@ -709,15 +833,10 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
         except Exception as exc:
             print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
     else:
-        index = VectorStoreIndex.from_vector_store(
-            vector_store,
-            # Embedding model should match the original embedding model
-            # embed_model=Settings.embed_model
-        )
         nodes = vector_store.get_nodes()
         table_infos = [
             TableInfo(
-                db_table_name=node.metadata['db_table_name'],
+                ref_table_name=node.metadata['ref_table_name'],
                 table_name=node.metadata['table_name'],
                 table_summary=node.metadata['table_summary']
             )
@@ -727,25 +846,30 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
     return table_infos
 
 async def run_agent():
-        
+    print("Indexing all tables started")
+    vector_index_dict = await index_all_tables(sql_database)
+    # vector_index_dict: Dict[str, VectorStoreIndex] = {}
+    print("Indexing all tables  completed")
+
     print("progress: 1")
 
     table_infos = get_table_infos(sql_database)
-    
-    # print("********** Start ************")
-    # for e in table_infos:
-    #     print(">>>>>>>>>>>>>>>>>>>>>>>>")
-    #     print(e)
-
-    # print("********* End *************")
 
     print("progress: 2")
 
-
+    table_node_mapping = SQLTableNodeMapping(sql_database)
     table_schema_objs = [
-        SQLTableSchema(table_name=t.db_table_name, context_str=t.table_summary)
+        SQLTableSchema(table_name=t.ref_table_name, context_str=t.table_summary)
         for t in table_infos
     ]  # add a SQLTableSchema for each table
+
+    obj_index = ObjectIndex.from_objects(
+        table_schema_objs,
+        table_node_mapping,
+        VectorStoreIndex,
+    )
+    obj_retriever = obj_index.as_retriever(similarity_top_k=3)
+
 
     sql_retriever = SQLRetriever(sql_database)
 
@@ -790,8 +914,9 @@ async def run_agent():
 
     # run some queries
     workflow1 = TextToSQLWorkflow1(
-        table_schema_objs,
+        obj_retriever,
         text2sql_prompt,
+        vector_index_dict,
         sql_retriever,
         response_synthesis_prompt,
         llm,
@@ -815,8 +940,9 @@ async def run_agent():
     # print("progress: 4")
 
     workflow2 = TextToSQLWorkflow2(
-        table_schema_objs,
+        obj_retriever,
         text2sql_prompt,
+        vector_index_dict,
         sql_retriever,
         response_synthesis_prompt,
         llm,
