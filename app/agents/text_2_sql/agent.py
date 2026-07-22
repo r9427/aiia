@@ -25,9 +25,13 @@ from llama_index.core.prompts import ChatPromptTemplate
 from llama_index.core.prompts.default_prompts import DEFAULT_TEXT_TO_SQL_PROMPT
 from llama_index.core.llms import ChatMessage, ChatResponse
 from llama_index.core.retrievers import SQLRetriever
-from llama_index.core.schema import TextNode
-from llama_index.utils.workflow import draw_all_possible_flows
+from llama_index.core.schema import TextNode, Document
 from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.utils.workflow import draw_all_possible_flows
+
+from qdrant_client import QdrantClient, AsyncQdrantClient
 
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import create_engine, text
@@ -80,6 +84,18 @@ llm = OpenAILike(
 )
 
 
+MAX_TABLE_PREVIEW_ROWS = 5
+MAX_TABLE_PREVIEW_COLS = 20
+MAX_CELL_CHARS = 120
+MAX_TABLE_STR_CHARS = 8000
+MAX_EXCLUDE_NAMES = 50
+MAX_TABLE_STR_DIRECT_CHARS = 12000
+TABLE_SUMMARY_CHUNK_CHARS = 9000
+MAX_COMPRESSED_TABLE_STR_CHARS = 7000
+
+qdrant_collection = "test2"
+
+
 def _extract_json_block(text: str) -> str:
     """Extract a JSON object from model output, handling fenced blocks."""
     if not text:
@@ -101,20 +117,116 @@ def _extract_json_block(text: str) -> str:
     return content[left : right + 1]
 
 
-def _predict_table_info(prompt_tmpl: ChatPromptTemplate, table_str: str, exclude_table_name_list: str) -> TableInfo:
-    """Get table info without tool-calling to avoid tool_choice conflicts."""
-    messages = prompt_tmpl.format_messages(
-        table_str=table_str,
-        exclude_table_name_list=exclude_table_name_list,
+def _predict_table_info(db_table_name: str, prompt_tmpl: ChatPromptTemplate, table_str: str, exclude_table_name_list: str) -> TableInfo:
+    """Predict table info; prefer structured_predict, then fallback to chat JSON parsing."""
+    try:
+        structured_llm = OpenAILike(
+            model=SystemUtil.CONFIG.model_name,
+            api_key=SystemUtil.CONFIG.model_api_key,
+            api_base=SystemUtil.CONFIG.model_base_url,
+            context_window=128000,
+            is_chat_model=True,
+            is_function_calling_model=False,
+            timeout=120,
+        )
+        structured_result = super(OpenAI, structured_llm).structured_predict(
+            TableInfo,
+            prompt_tmpl,
+            table_str=table_str,
+            exclude_table_name_list=exclude_table_name_list,
+        )
+        if not isinstance(structured_result, TableInfo):
+            structured_result = TableInfo.model_validate(structured_result)
+        return structured_result.model_copy(update={"db_table_name": db_table_name})
+    except Exception as e:
+        messages = prompt_tmpl.format_messages(
+            table_str=table_str,
+            exclude_table_name_list=exclude_table_name_list,
+        )
+
+        chat_response = llm.chat(messages)
+        payload = _extract_json_block(chat_response.message.content or "")
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise ValueError(f"Table summary response must be a JSON object, got: {type(data)}")
+        # Always take the true DB table name from code, not model output.
+        data["db_table_name"] = db_table_name
+        result = TableInfo.model_validate(data)
+        return result
+
+
+def _summarize_table_chunk(table_name: str, chunk_text: str) -> str:
+    """Summarize one oversized table chunk while preserving schema/value signal."""
+    prompt = (
+        "You are compressing table content for a Text-to-SQL system.\n"
+        "Keep signal needed for SQL generation, including:\n"
+        "1) column names exactly as shown,\n"
+        "2) data types/pattern hints,\n"
+        "3) representative values and notable categories,\n"
+        "4) potential key columns and join hints if visible.\n"
+        "Return plain text only, compact and factual.\n\n"
+        f"Table: {table_name}\n"
+        "Chunk:\n"
+        f"{chunk_text}"
     )
-    chat_response = llm.chat(messages)
-    payload = _extract_json_block(chat_response.message.content or "")
-    data = json.loads(payload)
-    return TableInfo.model_validate(data)
+    response = llm.chat([ChatMessage.from_str(prompt, role="user")])
+    return (response.message.content or "").strip()
+
+
+def _compress_large_table_str(table_name: str, raw_table_str: str) -> str:
+    """Compress very large table text via chunked LLM summaries."""
+    chunks = [
+        raw_table_str[i : i + TABLE_SUMMARY_CHUNK_CHARS]
+        for i in range(0, len(raw_table_str), TABLE_SUMMARY_CHUNK_CHARS)
+    ]
+
+    partial_summaries = []
+    for idx, chunk in enumerate(chunks, start=1):
+        summary = _summarize_table_chunk(table_name, chunk)
+        partial_summaries.append(f"[Chunk {idx}]\n{summary}")
+
+    merged = "\n\n".join(partial_summaries)
+    if len(merged) <= MAX_COMPRESSED_TABLE_STR_CHARS:
+        return merged
+
+    # One more pass if merged summaries are still too long.
+    final_prompt = (
+        "You are merging chunk summaries for a Text-to-SQL system.\n"
+        "Preserve all useful column/value cues, but keep the result concise.\n"
+        "Return plain text only.\n\n"
+        f"Table: {table_name}\n"
+        "Summaries:\n"
+        f"{merged}"
+    )
+    final_resp = llm.chat([ChatMessage.from_str(final_prompt, role="user")])
+    return (final_resp.message.content or "").strip()
+
+
+def _build_table_str_for_prompt(table_name: str, rows: List[tuple], columns: List[str]) -> str:
+    """Use full sampled table content when possible; compress with LLM only if oversized."""
+    if not rows:
+        return pd.DataFrame(columns=columns).to_csv(index=False)
+
+    raw_df = pd.DataFrame(rows, columns=columns)
+    raw_table_str = raw_df.to_csv(index=False)
+    if len(raw_table_str) <= MAX_TABLE_STR_DIRECT_CHARS:
+        return raw_table_str
+
+    try:
+        return _compress_large_table_str(table_name, raw_table_str)
+    except Exception:
+        # Fallback only if summarization fails unexpectedly.
+        fallback_df = raw_df.iloc[:MAX_TABLE_PREVIEW_ROWS, :MAX_TABLE_PREVIEW_COLS].copy()
+        fallback_df = fallback_df.map(lambda v: str(v)[:MAX_CELL_CHARS])
+        fallback_str = fallback_df.to_csv(index=False)
+        return fallback_str[:MAX_TABLE_STR_CHARS]
 
 class TableInfo(BaseModel):
     """Information regarding a structured table."""
 
+    db_table_name: str | None = Field(
+        None, description="db table name (original name in database, must be the same as in db)"
+    )
     table_name: str = Field(
         ..., description="table name (must be underscores and NO spaces)"
     )
@@ -192,6 +304,7 @@ class TextToSQLWorkflow1(Workflow):
     def generate_response(self, ctx: Context, ev: TextToSQLEvent) -> StopEvent:
         """Run SQL retrieval and generate response."""
         try:
+            print(f'Generated SQL: "{ev.sql}"')
             retrieved_rows = self.sql_retriever.retrieve(ev.sql)
         except (NotImplementedError, SQLAlchemyError) as exc:
             # Return a structured fallback instead of raising, so the workflow can continue.
@@ -233,12 +346,8 @@ tableinfo_path = output_dir.joinpath(tableinfo_dir)
 Util.remove_dir(tableinfo_path)
 tableinfo_path.mkdir(parents=True, exist_ok=True)
 
-dfs = []
-source_table_names = []
 
 def get_data():
-
-    print("============= Sql start ===============")
 
     sql_items = [
         ("users", "select * from users"),
@@ -258,9 +367,8 @@ def get_data():
 
 
     # avoid accumulating stale DataFrames when run_agent is called multiple times
-    dfs.clear()
-    source_table_names.clear()
-
+    dfs = []
+    source_table_names = []
     # for roundtripping
     for table_name, sql in sql_items:
         with engine.connect() as connection:
@@ -268,23 +376,6 @@ def get_data():
         dfs.append(df)
         source_table_names.append(table_name)
 
-    # for row in rows:
-    #     print(row)
-
-    print("============= Sql end ===============")
-
-def _get_tableinfo_with_index(idx: int):
-    results_gen = tableinfo_path.glob(f"{idx}_*")
-    results_list = list(results_gen)
-    if len(results_list) == 0:
-        return None
-    elif len(results_list) == 1:
-        path = results_list[0]
-        return TableInfo.model_validate_json(path.read_text(encoding="utf-8"))
-    else:
-        raise ValueError(
-            f"More than one file matching index: {list(results_gen)}"
-        )
 
 def get_table_context_str(table_schema_objs: List[SQLTableSchema]):
     """Get table context string."""
@@ -395,17 +486,35 @@ def _select_table_schema_objs(
 def index_all_tables(
     sql_database: SQLDatabase, table_index_dir: str = "output"
 ) -> Dict[str, VectorStoreIndex]:
-    """Index all tables."""
-    if not Path(table_index_dir).exists():
-        os.makedirs(table_index_dir)
-
     vector_index_dict = {}
     engine = sql_database.engine
     identifier_preparer = engine.dialect.identifier_preparer
-    for table_name in sql_database.get_usable_table_names():
-        # print(f"Indexing rows in table: {table_name}")
-        if not os.path.exists(f"{table_index_dir}/{table_name}"):
-            # get all rows from table
+
+
+    client = QdrantClient (
+        host="localhost",
+        port=6333
+    )
+
+    aclient = AsyncQdrantClient(
+        host="localhost",
+        port=6333
+    )
+
+    vector_store = QdrantVectorStore(
+        collection_name=qdrant_collection,
+        client=client,
+        aclient=aclient,
+        prefer_grpc=True,
+        enable_hybrid=True,
+        fastembed_sparse_model="Qdrant/bm25",
+    )
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    init_vector_db = False
+    if init_vector_db:
+        for table_name in sql_database.get_usable_table_names():
+            print(f"Indexing rows in table: {table_name}")
             with engine.connect() as conn:
                 quoted_table_name = identifier_preparer.quote_identifier(table_name)
                 cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name}"))
@@ -415,50 +524,42 @@ def index_all_tables(
                     row_tups.append(tuple(row))
 
             # index each row, put into vector store index
-            nodes = [TextNode(text=str(t)) for t in row_tups]
+            docs = [Document(text=str(t)) for t in row_tups]
 
             # put into vector store index (may fail if embedding provider returns invalid vectors)
             try:
-                index = VectorStoreIndex(nodes)
+                index = VectorStoreIndex.from_documents(
+                    documents=docs,
+                    storage_context=storage_context,
+                    use_async=True,
+                    # embed_model=Settings.embed_model,
+                )
             except Exception as exc:
                 print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
                 continue
 
-            # save index
-            index.set_index_id("vector_index")
-            index.storage_context.persist(f"{table_index_dir}/{table_name}")
-        else:
-            # rebuild storage context
-            storage_context = StorageContext.from_defaults(
-                persist_dir=f"{table_index_dir}/{table_name}"
-            )
-            # load index
-            index = load_index_from_storage(
-                storage_context, index_id="vector_index"
-            )
-        vector_index_dict[table_name] = index
+        # vector_index_dict[table_name] = index
+    else:
+        # rebuild storage context
+        print(f"Loading existing index for table")
+        # load index
+        index = VectorStoreIndex.from_vector_store(
+            vector_store,
+            # Embedding model should match the original embedding model
+            # embed_model=Settings.embed_model
+        )
 
-    return vector_index_dict
-
-vector_index_dict: Dict[str, VectorStoreIndex] = {}
-
-
-def _has_valid_embedding_api_key() -> bool:
-    """Allow self-hosted embedding endpoints to run without an API key."""
-    base_url = (SystemUtil.CONFIG.model_base_url or "").strip().lower()
-    is_self_hosted = (
-        base_url.startswith("http://")
-        and "dashscope.aliyuncs.com" not in base_url
-        and "api.openai.com" not in base_url
+    index = VectorStoreIndex.from_vector_store(
+        vector_store,
+        # Embedding model should match the original embedding model
+        # embed_model=Settings.embed_model
     )
+    return index
 
-    if is_self_hosted:
-        return True
-
-    key = (SystemUtil.CONFIG.model_api_key or "").strip()
-    if not key:
-        return False
-    return key.lower() not in {"na", "n/a", "none", "null", "your-api-key"}
+print("Indexing all tables started")
+vector_index_dict = index_all_tables(sql_database)
+# vector_index_dict: Dict[str, VectorStoreIndex] = {}
+print("Indexing all tables  completed")
 
 
 def get_table_context_and_rows_str(
@@ -479,7 +580,8 @@ def get_table_context_and_rows_str(
             table_info += table_opt_context
 
         # also lookup vector index to return relevant table rows (optional)
-        vector_index = vector_index_dict.get(table_schema_obj.table_name)
+        # vector_index = vector_index_dict.get(table_schema_obj.table_name)
+        vector_index = vector_index_dict
         if vector_index is not None:
             vector_retriever = vector_index.as_retriever(similarity_top_k=2)
             relevant_nodes = vector_retriever.retrieve(query_str)
@@ -492,70 +594,130 @@ def get_table_context_and_rows_str(
             print(f"> No row index found for table: {table_schema_obj.table_name}")
 
         if verbose:
-            print(f"> Table Info: {table_info}")
+            # print(f"> Table Info: {table_info}")
+            pass
 
         context_strs.append(table_info)
     return "\n\n".join(context_strs)
 
-async def run_agent():
-    global vector_index_dict
+def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
+    table_infos = []
+    init_vector_db = False
 
-    get_data()
 
-    prompt_str = """\
-    Give me a summary of the table with the following JSON format.
-
-    - The table name must be unique to the table and describe it while being concise.
-    - Do NOT output a generic table name (e.g. table, my_table).
-    - Output JSON only, with exactly these keys: table_name, table_summary.
-    - Do not include markdown code fences or extra commentary.
-
-    Do NOT make the table name one of the following: {exclude_table_name_list}
-
-    Table:
-    {table_str}
-
-    Summary: """
-
-    prompt_tmpl = ChatPromptTemplate(
-        message_templates=[ChatMessage.from_str(prompt_str, role="user")]
+    client = QdrantClient (
+        host="localhost",
+        port=6333
     )
 
+    aclient = AsyncQdrantClient(
+        host="localhost",
+        port=6333
+    )
+
+    vector_store = QdrantVectorStore(
+        collection_name='table_info',
+        client=client,
+        aclient=aclient,
+        prefer_grpc=True,
+        enable_hybrid=True,
+        fastembed_sparse_model="Qdrant/bm25",
+    )
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
     
+    if init_vector_db:
+        prompt_str = """\
+        Give me a summary of the table with the following JSON format.
 
-    table_names = set()
-    table_infos = []
-    for idx, df in enumerate(dfs):
-        table_info = _get_tableinfo_with_index(idx)
-        if table_info:
-            # Keep existing metadata and reserve name to avoid collisions.
-            table_names.add(table_info.table_name)
-        else:
-            while True:
-                df_str = df.head(10).to_csv()
-                table_info = _predict_table_info(
-                    prompt_tmpl,
-                    table_str=df_str,
-                    exclude_table_name_list=str(list(table_names)),
-                )
-                table_name = table_info.table_name
-                print(f"Processed table: {table_name}")
-                if table_name not in table_names:
-                    table_names.add(table_name)
-                    break
-                else:
-                    # try again
-                    print(f"Table name {table_name} already exists, trying again.")
-                    pass
+        - The table name must be unique to the table and describe it while being concise.
+        - Do NOT output a generic table name (e.g. table, my_table).
+        - Output JSON only, with exactly these keys: table_name, table_summary.
+        - Do not include markdown code fences or extra commentary.
 
-            # out_file = f"{tableinfo_dir}/{idx}_{table_name}.json"
-            out_file = f"{idx}_{table_name}.json"
-            # tableinfo_path.joinpath(out_file).write_text(table_info.model_dump_json(indent=4))
-            output_path = tableinfo_path.joinpath(out_file)
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(table_info.model_dump(), f)
+        Do NOT make the table name one of the following: {exclude_table_name_list}
 
-        table_infos.append(table_info)
+        Table:
+        {table_str}
+
+        Summary: """
+
+        prompt_tmpl = ChatPromptTemplate(
+            message_templates=[ChatMessage.from_str(prompt_str, role="user")]
+        )
+
+        summarized_table_names = set()
+        docs = []
+
+        # a = sql_database.get_single_table_info(table_name=table_name)
+        # b = sql_database.get_table_columns(table_name=table_name)
+        engine = sql_database.engine
+        identifier_preparer = engine.dialect.identifier_preparer
+        for table_name in sql_database.get_usable_table_names():
+            # print(f"Indexing rows in table: {table_name}")
+            with engine.connect() as conn:
+                quoted_table_name = identifier_preparer.quote_identifier(table_name)
+                cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name} LIMIT 10"))
+                rows = cursor.fetchall()
+                row_tups = []
+                for row in rows:
+                    row_tups.append(tuple(row))
+            df_str = _build_table_str_for_prompt(table_name, row_tups, list(cursor.keys()))
+
+            print(f"Process table: {table_name}")
+            table_info = _predict_table_info(
+                db_table_name=table_name,
+                prompt_tmpl=prompt_tmpl,
+                table_str=df_str,
+                exclude_table_name_list=str(list(summarized_table_names)),
+            )
+            summarized_table_name = table_info.table_name
+            if summarized_table_name not in summarized_table_names:
+                summarized_table_names.add(summarized_table_name)
+                table_infos.append(table_info)
+
+                # index each row, put into vector store index
+                docs.append(Document(
+                    text=str(table_info),
+                    metadata={
+                        "db_table_name": table_info.db_table_name,
+                        "table_name": table_info.table_name,
+                        "table_summary": table_info.table_summary
+                    }
+                ))
+        
+        # put into vector store index (may fail if embedding provider returns invalid vectors)
+        try:
+            index = VectorStoreIndex.from_documents(
+                documents=docs,
+                storage_context=storage_context,
+                use_async=True,
+                # embed_model=Settings.embed_model,
+            )
+        except Exception as exc:
+            print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
+    else:
+        index = VectorStoreIndex.from_vector_store(
+            vector_store,
+            # Embedding model should match the original embedding model
+            # embed_model=Settings.embed_model
+        )
+        nodes = vector_store.get_nodes()
+        table_infos = [
+            TableInfo(
+                db_table_name=node.metadata['db_table_name'],
+                table_name=node.metadata['table_name'],
+                table_summary=node.metadata['table_summary']
+            )
+            for node in nodes
+        ]
+    
+    return table_infos
+
+async def run_agent():
+        
+    print("progress: 1")
+
+    table_infos = get_table_infos(sql_database)
     
     # print("********** Start ************")
     # for e in table_infos:
@@ -564,13 +726,12 @@ async def run_agent():
 
     # print("********* End *************")
 
-    # test = True
-    # if test:
-    #     return
+    print("progress: 2")
+
 
     table_schema_objs = [
-        SQLTableSchema(table_name=source_table_names[idx], context_str=t.table_summary)
-        for idx, t in enumerate(table_infos)
+        SQLTableSchema(table_name=t.db_table_name, context_str=t.table_summary)
+        for t in table_infos
     ]  # add a SQLTableSchema for each table
 
     sql_retriever = SQLRetriever(sql_database)
@@ -583,7 +744,7 @@ async def run_agent():
         "\n- Do not use reserved keywords as table aliases (e.g., IF, KEY, ORDER, GROUP)."
         "\n- Prefer safe aliases like t1, t2, u, r, ur, fb."
     )
-    print(text2sql_prompt.template)
+    # print(text2sql_prompt.template)
 
     response_synthesis_prompt_str = (
         "Given an input question, synthesize a response from the query results.\n"
@@ -597,16 +758,16 @@ async def run_agent():
     )
     
 
-    draw_all_possible_flows(
-        TextToSQLWorkflow1, filename="text_to_sql_table_retrieval.html"
-    )
+    # draw_all_possible_flows(
+    #     TextToSQLWorkflow1, filename="text_to_sql_table_retrieval.html"
+    # )
 
     # Read the contents of the HTML file
-    with open("text_to_sql_table_retrieval.html", "r") as file:
-        html_content = file.read()
+    # with open("text_to_sql_table_retrieval.html", "r") as file:
+    #     html_content = file.read()
 
     # Display the HTML content
-    display(HTML(html_content))
+    # display(HTML(html_content))
 
 
     # run some queries
@@ -623,24 +784,30 @@ async def run_agent():
 
 
     queries = [
-        "list issue_feedbacks associated with yiming",
+        "list issues associated with yiming, please include issue link and issue id, user name",
         "show users and their roles",
     ]
     # response = await workflow.run(
     #     query=queries[1]
     # )
     # print(str(response))
+    print("progress: 3")
 
-    vector_index_dict = index_all_tables(sql_database)
+    # vector_index_dict = index_all_tables(sql_database)
+    # print("progress: 4")
+
     workflow2 = TextToSQLWorkflow2(
         table_schema_objs,
         text2sql_prompt,
         sql_retriever,
         response_synthesis_prompt,
         llm,
-        verbose=True,
+        verbose=False,
+        timeout=100
     )
+
     response = await workflow2.run(query=queries[0])
+    print("progress: 4")
 
     print(str(response))
 
