@@ -24,7 +24,7 @@ from llama_index.core.objects import SQLTableSchema
 from llama_index.core.prompts import ChatPromptTemplate
 from llama_index.core.prompts.default_prompts import DEFAULT_TEXT_TO_SQL_PROMPT
 from llama_index.core.llms import ChatMessage, ChatResponse
-from llama_index.core.retrievers import SQLRetriever
+from llama_index.core.retrievers import SQLRetriever, NLSQLRetriever
 from llama_index.core.schema import TextNode, Document
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.embeddings.fastembed import FastEmbedEmbedding
@@ -394,7 +394,13 @@ def get_table_context_str(table_schema_objs: List[SQLTableSchema]):
 
 def parse_response_to_sql(chat_response: ChatResponse) -> str:
     """Parse response to SQL."""
-    response = chat_response.message.content
+    response = chat_response.message.content or ""
+
+    # Unwrap fenced code blocks first, e.g. ```sql ... ```.
+    fenced = re.search(r"```(?:sql)?\s*(.*?)\s*```", response, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        response = fenced.group(1)
+
     sql_query_start = response.find("SQLQuery:")
     if sql_query_start != -1:
         response = response[sql_query_start:]
@@ -404,7 +410,14 @@ def parse_response_to_sql(chat_response: ChatResponse) -> str:
     sql_result_start = response.find("SQLResult:")
     if sql_result_start != -1:
         response = response[:sql_result_start]
-    return response.strip().strip("```").strip()
+
+    response = response.strip()
+
+    # Some models return a bare leading language marker ("sql") on its own line.
+    response = re.sub(r"^sql\s*", "", response, flags=re.IGNORECASE)
+
+    # Remove trailing semicolon noise and keep SQL body clean.
+    return response.strip().strip(";").strip()
 
 
 def _rewrite_reserved_aliases(sql: str, dialect_name: str) -> str:
@@ -735,6 +748,11 @@ async def run_agent():
     ]  # add a SQLTableSchema for each table
 
     sql_retriever = SQLRetriever(sql_database)
+
+    # default retrieval (return_raw=False)
+    # nl_sql_retriever = NLSQLRetriever(
+    #     sql_database, tables=["city_stats"], return_raw=False, rows_retrievers=None, cols_retrievers=None
+    # )
     
     text2sql_prompt = DEFAULT_TEXT_TO_SQL_PROMPT.partial_format(
         dialect=engine.dialect.name
@@ -784,7 +802,7 @@ async def run_agent():
 
 
     queries = [
-        "list issues associated with yiming, please include issue link and issue id, user name",
+        "list issues created by zhanbo, please include issue link and issue id, title, description, user name",
         "show users and their roles",
     ]
     # response = await workflow.run(
