@@ -5,7 +5,8 @@ import os
 import pandas as pd
 from IPython.display import display, HTML
 import re
-from typing import List, Dict
+import time
+from typing import Any, List, Dict
 
 from llama_index.llms.openai import OpenAI
 from llama_index.llms.openai_like import OpenAILike
@@ -32,7 +33,7 @@ from llama_index.embeddings.fastembed import FastEmbedEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.utils.workflow import draw_all_possible_flows
 
-from qdrant_client import QdrantClient, AsyncQdrantClient
+from qdrant_client import QdrantClient, AsyncQdrantClient, models
 
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import create_engine, text
@@ -59,26 +60,6 @@ Settings.llm = OpenAILike(
     is_function_calling_model=True
 )
 
-vector_table_prefix = "car_"
-
-def get_vector_table_name(name: str) -> str:
-    return f"{vector_table_prefix}{name}"
-
-
-db_url = SystemUtil.CONFIG.get_db_url()
-# engine = create_async_engine(
-#     db_url,
-#     pool_size=20,
-#     max_overflow=300,
-#     pool_timeout=60,
-#     # pool_recycle=120,
-#     # pool_pre_ping=True,
-#     echo=False,
-#     future=True
-# )
-engine = create_engine(db_url)
-sql_database = SQLDatabase(engine)
-
 llm = OpenAILike(
     model=SystemUtil.CONFIG.model_name,
     api_base=SystemUtil.CONFIG.model_base_url,
@@ -86,8 +67,50 @@ llm = OpenAILike(
     context_window=128000,
     is_chat_model=True,
     is_function_calling_model=True,
-    timeout=120,
+    timeout=300,
 )
+
+vector_table_prefix = "car_"
+use_mysql = False
+
+def get_vector_table_name(name: str) -> str:
+    return f"{vector_table_prefix}{name}"
+
+
+def _qualified_table_name(identifier_preparer, table_name: str) -> str:
+    quoted_table_name = identifier_preparer.quote_identifier(table_name)
+    if not use_mysql:
+        quoted_schema = identifier_preparer.quote_schema(SystemUtil.CONFIG.postgresql_schema)
+        return f"{quoted_schema}.{quoted_table_name}"
+    return quoted_table_name
+
+def get_sql_database(use_mysql: bool = False) -> SQLDatabase:
+    if use_mysql:
+        db_url = SystemUtil.CONFIG.get_mysql_url()
+        engine = create_engine(db_url)
+        sql_database = SQLDatabase(engine)
+    else:
+        db_url = SystemUtil.CONFIG.get_pg_url()
+        if "+aiomysql" in db_url:
+            db_url = db_url.replace("+aiomysql", "+pymysql")
+        elif "+asyncmy" in db_url:
+            db_url = db_url.replace("+asyncmy", "+pymysql")
+        elif "+asyncpg" in db_url:
+            db_url = db_url.replace("+asyncpg", "+psycopg2")
+
+        engine = create_engine(
+            db_url,
+            pool_size=20,
+            max_overflow=300,
+            pool_timeout=60,
+            pool_pre_ping=True,
+            echo=False,
+            future=True,
+        )
+        sql_database = SQLDatabase(engine, schema=SystemUtil.CONFIG.postgresql_schema)
+    return sql_database
+
+sql_database = get_sql_database(use_mysql=False)
 
 
 MAX_TABLE_PREVIEW_ROWS = 5
@@ -98,8 +121,26 @@ MAX_EXCLUDE_NAMES = 50
 MAX_TABLE_STR_DIRECT_CHARS = 12000
 TABLE_SUMMARY_CHUNK_CHARS = 9000
 MAX_COMPRESSED_TABLE_STR_CHARS = 7000
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BASE_SECONDS = 2
+INDEX_CONSUMER_COUNT = 8
 
-qdrant_collection = "test2"
+
+def _chat_with_retry(messages: List[ChatMessage]) -> ChatResponse:
+    """Call LLM chat with bounded retries for transient timeout errors."""
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            return llm.chat(messages)
+        except Exception as exc:
+            is_timeout = "timeout" in str(exc).lower()
+            if (not is_timeout) or attempt == LLM_MAX_RETRIES:
+                raise
+            wait_seconds = LLM_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            print(f"LLM timeout (attempt {attempt}/{LLM_MAX_RETRIES}); retrying in {wait_seconds}s: {exc}")
+            time.sleep(wait_seconds)
+
+    # Unreachable fallback to satisfy static analyzers.
+    raise RuntimeError("Failed to receive LLM response after retries")
 
 
 def _extract_json_block(text: str) -> str:
@@ -133,7 +174,7 @@ def _predict_table_info(ref_table_name: str, prompt_tmpl: ChatPromptTemplate, ta
             context_window=128000,
             is_chat_model=True,
             is_function_calling_model=False,
-            timeout=120,
+            timeout=300,
         )
         structured_result = super(OpenAI, structured_llm).structured_predict(
             TableInfo,
@@ -150,7 +191,7 @@ def _predict_table_info(ref_table_name: str, prompt_tmpl: ChatPromptTemplate, ta
             exclude_table_name_list=exclude_table_name_list,
         )
 
-        chat_response = llm.chat(messages)
+        chat_response = _chat_with_retry(messages)
         payload = _extract_json_block(chat_response.message.content or "")
         data = json.loads(payload)
         if not isinstance(data, dict):
@@ -160,6 +201,39 @@ def _predict_table_info(ref_table_name: str, prompt_tmpl: ChatPromptTemplate, ta
         result = TableInfo.model_validate(data)
         return result
 
+def _predict_table_columns_info(prompt_tmpl: ChatPromptTemplate, table_str: str) -> TableColumnsInfo:
+    """Predict table columns info; prefer structured_predict, then fallback to chat JSON parsing."""
+    try:
+        structured_llm = OpenAILike(
+            model=SystemUtil.CONFIG.model_name,
+            api_key=SystemUtil.CONFIG.model_api_key,
+            api_base=SystemUtil.CONFIG.model_base_url,
+            context_window=128000,
+            is_chat_model=True,
+            is_function_calling_model=False,
+            timeout=300,
+        )
+        structured_result = super(OpenAI, structured_llm).structured_predict(
+            TableColumnsInfo,
+            prompt_tmpl,
+            table_str=table_str
+        )
+        if not isinstance(structured_result, TableColumnsInfo):
+            structured_result = TableColumnsInfo.model_validate(structured_result)
+        return structured_result
+    except Exception as e:
+        messages = prompt_tmpl.format_messages(
+            table_str=table_str
+        )
+
+        chat_response = _chat_with_retry(messages)
+        payload = _extract_json_block(chat_response.message.content or "")
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            raise ValueError(f"Table columns response must be a JSON object, got: {type(data)}")
+        # Always take the true DB table name from code, not model output.
+        result = TableColumnsInfo.model_validate(data)
+        return result
 
 def _summarize_table_chunk(table_name: str, chunk_text: str) -> str:
     """Summarize one oversized table chunk while preserving schema/value signal."""
@@ -175,7 +249,7 @@ def _summarize_table_chunk(table_name: str, chunk_text: str) -> str:
         "Chunk:\n"
         f"{chunk_text}"
     )
-    response = llm.chat([ChatMessage.from_str(prompt, role="user")])
+    response = _chat_with_retry([ChatMessage.from_str(prompt, role="user")])
     return (response.message.content or "").strip()
 
 
@@ -204,17 +278,42 @@ def _compress_large_table_str(table_name: str, raw_table_str: str) -> str:
         "Summaries:\n"
         f"{merged}"
     )
-    final_resp = llm.chat([ChatMessage.from_str(final_prompt, role="user")])
+    final_resp = _chat_with_retry([ChatMessage.from_str(final_prompt, role="user")])
     return (final_resp.message.content or "").strip()
 
 
 def _build_table_str_for_prompt(table_name: str, rows: List[tuple], columns: List[str]) -> str:
-    """Use full sampled table content when possible; compress with LLM only if oversized."""
-    if not rows:
-        return pd.DataFrame(columns=columns).to_csv(index=False)
+    """Build a structured prompt payload (schema + sampled rows) for table understanding."""
+    def _normalize_row(row: Any) -> tuple:
+        # Ensure row shape always aligns with DataFrame columns.
+        if hasattr(row, "_mapping"):
+            return tuple(row._mapping.get(col) for col in columns)
+        if isinstance(row, (tuple, list)):
+            seq = tuple(row)
+            if len(seq) >= len(columns):
+                return seq[: len(columns)]
+            return seq + (None,) * (len(columns) - len(seq))
+        if len(columns) == 1:
+            return (row,)
+        return (row,) + (None,) * (len(columns) - 1)
 
-    raw_df = pd.DataFrame(rows, columns=columns)
-    raw_table_str = raw_df.to_csv(index=False)
+    if not rows:
+        empty_payload = {
+            "table_name": table_name,
+            "columns": columns,
+            "sample_rows": [],
+        }
+        return json.dumps(empty_payload, ensure_ascii=False, indent=2)
+
+    normalized_rows = [_normalize_row(row) for row in rows]
+    raw_df = pd.DataFrame(normalized_rows, columns=columns)
+    sample_rows = raw_df.iloc[:MAX_TABLE_PREVIEW_ROWS].to_dict(orient="records")
+    raw_payload = {
+        "table_name": table_name,
+        "columns": columns,
+        "sample_rows": sample_rows,
+    }
+    raw_table_str = json.dumps(raw_payload, ensure_ascii=False, indent=2, default=str)
     if len(raw_table_str) <= MAX_TABLE_STR_DIRECT_CHARS:
         return raw_table_str
 
@@ -224,7 +323,12 @@ def _build_table_str_for_prompt(table_name: str, rows: List[tuple], columns: Lis
         # Fallback only if summarization fails unexpectedly.
         fallback_df = raw_df.iloc[:MAX_TABLE_PREVIEW_ROWS, :MAX_TABLE_PREVIEW_COLS].copy()
         fallback_df = fallback_df.map(lambda v: str(v)[:MAX_CELL_CHARS])
-        fallback_str = fallback_df.to_csv(index=False)
+        fallback_payload = {
+            "table_name": table_name,
+            "columns": list(fallback_df.columns),
+            "sample_rows": fallback_df.to_dict(orient="records"),
+        }
+        fallback_str = json.dumps(fallback_payload, ensure_ascii=False, indent=2)
         return fallback_str[:MAX_TABLE_STR_CHARS]
 
 class TableInfo(BaseModel):
@@ -238,6 +342,19 @@ class TableInfo(BaseModel):
     )
     table_summary: str = Field(
         ..., description="short, concise summary/caption of the table"
+    )
+
+class TableColumnsInfo(BaseModel):
+    """Column names information regarding a structured table."""
+
+    id_column_name: str | None = Field(
+        None, description="ID column name, indicating the column is id of the record"
+    )
+    create_time_column_name: str | None = Field(
+        None, description="create time column name, indicating the column is create time of the record"
+    )
+    update_time_column_name: str | None = Field(
+        None, description="update time column name, indicating the column is update time of the record"
     )
 
 class TableRetrieveEvent(Event):
@@ -308,7 +425,7 @@ class TextToSQLWorkflow1(Workflow):
         )
         chat_response = self.llm.chat(fmt_messages)
         sql = parse_response_to_sql(chat_response)
-        sql = _rewrite_reserved_aliases(sql, engine.dialect.name)
+        sql = _rewrite_reserved_aliases(sql, sql_database.engine.dialect.name)
         return TextToSQLEvent(sql=sql, query=ev.query)
 
     @step
@@ -382,7 +499,7 @@ def get_data():
     source_table_names = []
     # for roundtripping
     for table_name, sql in sql_items:
-        with engine.connect() as connection:
+        with sql_database.engine.connect() as connection:
             df = pd.read_sql(sql, connection)
         dfs.append(df)
         source_table_names.append(table_name)
@@ -547,8 +664,8 @@ async def index_all_tables2(
             print(f"Indexing rows in table: {table_name}")
             docs = []
             with engine.connect() as conn:
-                quoted_table_name = identifier_preparer.quote_identifier(table_name)
-                cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name}"))
+                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}"))
                 result = cursor.fetchall()
                 # row_tups = []
                 for row in result:
@@ -623,7 +740,7 @@ async def index_db_tables(client: QdrantClient, aclient: AsyncQdrantClient, sql_
     producer = asyncio.create_task(produce_queue(queue, aclient, sql_database))
     consumers = [
         asyncio.create_task(consume_queue(queue, client, aclient, sql_database))
-        for _ in range(40)
+        for _ in range(INDEX_CONSUMER_COUNT)
     ]
 
     try:
@@ -643,12 +760,70 @@ async def produce_queue(queue: asyncio.Queue, aclient: AsyncQdrantClient, sql_da
             print(f"Skip table '{table_name}' while checking collection existence: {exc}")
             continue
         if existed:
+            points_count = await aclient.count(
+                collection_name=vector_table_name,
+                # count_filter=models.Filter(
+                #     must=[
+                #         models.FieldCondition(key="color", match=models.MatchValue(value="red")),
+                #     ]
+                # ),
+                exact=True,
+            )
+    
+            a = await aclient.query_points(
+                collection_name=vector_table_name,
+                with_payload=True,
+                limit=10
+            )
+            # print('a: ', a)
+
+            points = await get_collection_points(
+                aclient=aclient,
+                collection_name=vector_table_name,
+                order_by_columns=[
+                    {"column_name": 'ref_create_time', "asc": True},
+                    {"column_name": 'ref_update_time', "asc": False},
+                ]
+            )
+            print("points: ", points)
             continue
         await queue.put(table_name)
 
 async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
     engine = sql_database.engine
     identifier_preparer = engine.dialect.identifier_preparer
+
+
+    prompt_str = """\
+        Identify the table's ID/create-time/update-time columns.
+
+        Input table payload is JSON, not CSV. It has exactly these keys:
+        - table_name: string
+        - columns: string[]
+        - sample_rows: object[]
+
+        Use only the provided JSON fields (table_name, columns, sample_rows).
+        Do not invent columns that are not present in columns.
+
+        Return JSON only with exactly these keys:
+        - id_column_name
+        - create_time_column_name
+        - update_time_column_name
+
+        Output rules:
+        - Each value must be either a column name from columns or null.
+        - If uncertain, return null.
+        - No markdown, no code fences, no comments, no extra keys.
+
+        Table JSON:
+        {table_str}
+        """
+
+    prompt_tmpl = ChatPromptTemplate(
+        message_templates=[ChatMessage.from_str(prompt_str, role="user")]
+    )
+
+
     while True:
         table_name = await queue.get()
         try:
@@ -664,23 +839,95 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
+
+            with engine.connect() as conn:
+                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name} LIMIT 10"))
+                rows = cursor.fetchall()
+                row_tups = []
+                for row in rows:
+                    row_tups.append(tuple(row))
+            table_str = _build_table_str_for_prompt(table_name, row_tups, list(cursor.keys()))
+            table_columns_info = _predict_table_columns_info(
+                prompt_tmpl=prompt_tmpl,
+                table_str=table_str
+            )
+
+            print("> Table Columns Info:", table_columns_info)
+
+            order_by_columns = []
+            if table_columns_info.create_time_column_name:
+                order_by_columns.append(f"{table_columns_info.create_time_column_name} ASC")
+            
+            if table_columns_info.update_time_column_name:
+                order_by_columns.append(f"{table_columns_info.update_time_column_name} DESC")
+
+            order_by_sql = ""
+            if order_by_columns:
+                order_by_sql = " ORDER BY " + ", ".join(order_by_columns)
+
             docs = []
             with engine.connect() as conn:
-                quoted_table_name = identifier_preparer.quote_identifier(table_name)
-                cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name}"))
-                result = cursor.fetchall()
-                for row in result:
-                    ref_id = row._mapping
-                    ref_created_at = ref_id.get("created_at", "")
-                    ref_updated_at = ref_id.get("updated_at", "")
+                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}{order_by_sql}"))
+                rows = cursor.fetchall()
+
+                # client.retrieve()
+                # client.scroll()
+                # client.search_matrix_offsets()
+                # client.query(collection_name=vector_table_name, limit=1)  # Test query to ensure collection is accessible
+                # client.query_points()
+                # client.query_batch()
+                # client.query_batch_points()
+                # client.count()
+
+                existed = client.collection_exists(collection_name=vector_table_name)
+                points_count = 0
+                points = []
+                if existed:
+                    
+                    print('points: ', points)
+
+                print("points_count: ", points_count)
+
+                new_records = []
+                updated_records = []
+                removed_records = []
+
+
+                def find_matching_point(row_mapping, points):
+                    for point in points:
+                        payload = point.payload
+                        if not payload:
+                            continue
+                        if table_columns_info.id_column_name and row_mapping.get(table_columns_info.id_column_name) == payload.get(table_columns_info.id_column_name):
+                            return point
+                    return None
+
+                for row in rows:
+                    row_mapping = row._mapping
+
+                    points = await get_collection_points(
+                        aclient=aclient,
+                        collection_name=vector_table_name,
+                        order_by_columns=[
+                            {"column_name": table_columns_info.create_time_column_name, "asc": True},
+                            {"column_name": table_columns_info.update_time_column_name, "asc": False},
+                        ]
+                    )
+
+
                     docs.append(
                         Document(
                             text=str(tuple(row)),
                             metadata={
                                 "ref_table_name": table_name,
-                                "ref_id": "",
-                                "ref_created_at": "",
-                                "ref_updated_at": "",
+                                "ref_id_column_name": table_columns_info.id_column_name,
+                                "ref_create_time_column_name": table_columns_info.create_time_column_name,
+                                "ref_update_time_column_name": table_columns_info.update_time_column_name,
+                                "ref_id": row_mapping.get(table_columns_info.id_column_name, None),
+                                "ref_create_time": row_mapping.get(table_columns_info.create_time_column_name, None),
+                                "ref_update_time": row_mapping.get(table_columns_info.update_time_column_name, None),
                             },
                         )
                     )
@@ -699,6 +946,61 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
         finally:
             queue.task_done()
 
+async def get_collection_points(aclient: AsyncQdrantClient, collection_name: str, order_by_columns: list[dict] = None) -> List[models.ScoredPoint]:
+    count_response = await aclient.count(
+        collection_name=collection_name,
+        # count_filter=models.Filter(
+        #     must=[
+        #         models.FieldCondition(key="color", match=models.MatchValue(value="red")),
+        #     ]
+        # ),
+        exact=True,
+    )
+    points_count = count_response.count if count_response else 0
+
+    if points_count == 0:
+        return []
+
+    query = None
+    valid_order_by_columns = []
+    if order_by_columns:
+        valid_order_by_columns = [
+            col for col in order_by_columns
+            if isinstance(col, dict) and col.get("column_name")
+        ]
+        if valid_order_by_columns:
+            # Qdrant OrderByQuery currently accepts a single order_by (str or OrderBy), not a list.
+            first_order_by = valid_order_by_columns[0]
+            query = models.OrderByQuery(
+                order_by=models.OrderBy(
+                    key=first_order_by["column_name"],
+                    direction=models.Direction.ASC if first_order_by.get("asc", True) else models.Direction.DESC,
+                )
+            )
+
+    try:
+        points_response = await aclient.query_points(
+            collection_name=collection_name,
+            with_payload=True,
+            query=query,
+            limit=points_count
+        )
+        points = points_response.points if points_response and points_response.points else []
+        if query is None and valid_order_by_columns:
+            return points
+        return points
+    except Exception as exc:
+        # Qdrant order_by requires payload range index. Fallback to plain fetch + in-memory sort.
+        if query is not None and "No range index for `order_by` key" in str(exc):
+            fallback_response = await aclient.query_points(
+                collection_name=collection_name,
+                with_payload=True,
+                query=None,
+                limit=points_count,
+            )
+            fallback_points = fallback_response.points if fallback_response and fallback_response.points else []
+            return fallback_points
+        raise
 
 def get_table_context_and_rows_str(
     query_str: str,
@@ -743,13 +1045,13 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
     init_vector_db = True  # Set to True to index all tables; False to load existing vector store indices.
     vector_table_name = get_vector_table_name("table_info")
 
-    client = QdrantClient (
-        host="localhost",
-        port=6333
+    client = QdrantClient(
+        host=SystemUtil.CONFIG.qdrant_host,
+        port=SystemUtil.CONFIG.qdrant_port,
     )
     aclient = AsyncQdrantClient(
-        host="localhost",
-        port=6333
+        host=SystemUtil.CONFIG.qdrant_host,
+        port=SystemUtil.CONFIG.qdrant_port,
     )
 
     vector_store = QdrantVectorStore(
@@ -764,19 +1066,29 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
     
     if init_vector_db:
         prompt_str = """\
-        Give me a summary of the table with the following JSON format.
+        Create a concise, specific summary for this table.
 
-        - The table name must be unique to the table and describe it while being concise.
-        - Do NOT output a generic table name (e.g. table, my_table).
-        - Output JSON only, with exactly these keys: table_name, table_summary.
-        - Do not include markdown code fences or extra commentary.
+        Input table payload is JSON, not CSV. It has exactly these keys:
+        - table_name: string
+        - columns: string[]
+        - sample_rows: object[]
 
-        Do NOT make the table name one of the following: {exclude_table_name_list}
+        Use only the provided JSON fields (table_name, columns, sample_rows).
 
-        Table:
+        Return JSON only with exactly these keys:
+        - table_name
+        - table_summary
+
+        Output rules:
+        - table_name must be concise, unique, and descriptive.
+        - table_name must not be generic (e.g. table, my_table).
+        - table_name must not be one of: {exclude_table_name_list}
+        - table_summary should describe purpose, main entities, and key value patterns.
+        - No markdown, no code fences, no comments, no extra keys.
+
+        Table JSON:
         {table_str}
-
-        Summary: """
+        """
 
         prompt_tmpl = ChatPromptTemplate(
             message_templates=[ChatMessage.from_str(prompt_str, role="user")]
@@ -792,8 +1104,8 @@ def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
         for table_name in sql_database.get_usable_table_names():
             # print(f"Indexing rows in table: {table_name}")
             with engine.connect() as conn:
-                quoted_table_name = identifier_preparer.quote_identifier(table_name)
-                cursor = conn.execute(text(f"SELECT * FROM {quoted_table_name} LIMIT 10"))
+                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name} LIMIT 10"))
                 rows = cursor.fetchall()
                 row_tups = []
                 for row in rows:
@@ -879,7 +1191,7 @@ async def run_agent():
     # )
     
     text2sql_prompt = DEFAULT_TEXT_TO_SQL_PROMPT.partial_format(
-        dialect=engine.dialect.name
+        dialect=sql_database.engine.dialect.name
     )
     text2sql_prompt.template += (
         "\n\nWhen generating SQL for MySQL:"

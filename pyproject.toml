@@ -26,6 +26,7 @@ dependencies = [
     "milvus-lite>=3.0",
     "pandas>=3.0.3",
     "playwright>=1.60.0",
+    "psycopg2>=2.9.12",
     "pymilvus[milvus-lite,model]>=3.0.0",
     "pymysql>=1.2.0",
     "requests>=2.34.2",
