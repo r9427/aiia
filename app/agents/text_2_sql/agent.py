@@ -760,32 +760,6 @@ async def produce_queue(queue: asyncio.Queue, aclient: AsyncQdrantClient, sql_da
             print(f"Skip table '{table_name}' while checking collection existence: {exc}")
             continue
         if existed:
-            points_count = await aclient.count(
-                collection_name=vector_table_name,
-                # count_filter=models.Filter(
-                #     must=[
-                #         models.FieldCondition(key="color", match=models.MatchValue(value="red")),
-                #     ]
-                # ),
-                exact=True,
-            )
-    
-            a = await aclient.query_points(
-                collection_name=vector_table_name,
-                with_payload=True,
-                limit=10
-            )
-            # print('a: ', a)
-
-            points = await get_collection_points(
-                aclient=aclient,
-                collection_name=vector_table_name,
-                order_by_columns=[
-                    {"column_name": 'ref_create_time', "asc": True},
-                    {"column_name": 'ref_update_time', "asc": False},
-                ]
-            )
-            print("points: ", points)
             continue
         await queue.put(table_name)
 
@@ -872,51 +846,8 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
                 cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}{order_by_sql}"))
                 rows = cursor.fetchall()
 
-                # client.retrieve()
-                # client.scroll()
-                # client.search_matrix_offsets()
-                # client.query(collection_name=vector_table_name, limit=1)  # Test query to ensure collection is accessible
-                # client.query_points()
-                # client.query_batch()
-                # client.query_batch_points()
-                # client.count()
-
-                existed = client.collection_exists(collection_name=vector_table_name)
-                points_count = 0
-                points = []
-                if existed:
-                    
-                    print('points: ', points)
-
-                print("points_count: ", points_count)
-
-                new_records = []
-                updated_records = []
-                removed_records = []
-
-
-                def find_matching_point(row_mapping, points):
-                    for point in points:
-                        payload = point.payload
-                        if not payload:
-                            continue
-                        if table_columns_info.id_column_name and row_mapping.get(table_columns_info.id_column_name) == payload.get(table_columns_info.id_column_name):
-                            return point
-                    return None
-
                 for row in rows:
                     row_mapping = row._mapping
-
-                    points = await get_collection_points(
-                        aclient=aclient,
-                        collection_name=vector_table_name,
-                        order_by_columns=[
-                            {"column_name": table_columns_info.create_time_column_name, "asc": True},
-                            {"column_name": table_columns_info.update_time_column_name, "asc": False},
-                        ]
-                    )
-
-
                     docs.append(
                         Document(
                             text=str(tuple(row)),
