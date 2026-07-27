@@ -71,7 +71,7 @@ llm = OpenAILike(
 )
 
 vector_table_prefix = "car_"
-use_mysql = False
+use_mysql = True
 
 def get_vector_table_name(name: str) -> str:
     return f"{vector_table_prefix}{name}"
@@ -110,7 +110,7 @@ def get_sql_database(use_mysql: bool = False) -> SQLDatabase:
         sql_database = SQLDatabase(engine, schema=SystemUtil.CONFIG.postgresql_schema)
     return sql_database
 
-sql_database = get_sql_database(use_mysql=False)
+sql_database = get_sql_database(use_mysql=use_mysql)
 
 
 MAX_TABLE_PREVIEW_ROWS = 5
@@ -736,32 +736,46 @@ async def index_all_tables(
 
 
 async def index_db_tables(client: QdrantClient, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
-    queue = asyncio.Queue(1000)
-    producer = asyncio.create_task(produce_queue(queue, aclient, sql_database))
-    consumers = [
-        asyncio.create_task(consume_queue(queue, client, aclient, sql_database))
-        for _ in range(INDEX_CONSUMER_COUNT)
-    ]
-
     try:
-        await producer
-        await queue.join()
-    finally:
-        for consumer in consumers:
-            consumer.cancel()
-        await asyncio.gather(*consumers, return_exceptions=True)
+        async with asyncio.TaskGroup() as task_group:
+            queue = asyncio.Queue(100)
+            producers = [task_group.create_task(produce_queue(queue, aclient, sql_database))]
+            consumers = list()
+            for index in range(10):
+                consumers.append(task_group.create_task(
+                    consume_queue(queue, client, aclient, sql_database)
+                ))
+            await asyncio.gather(*producers)
+            await queue.join()
+            for consumer in consumers:
+                consumer.cancel()
+    except Exception as e:
+            raise e
 
 async def produce_queue(queue: asyncio.Queue, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
+    engine = sql_database.engine
+    identifier_preparer = engine.dialect.identifier_preparer
     for table_name in sql_database.get_usable_table_names():
         vector_table_name = get_vector_table_name(table_name)
         try:
             existed = await aclient.collection_exists(collection_name=vector_table_name)
+            if existed:
+                count_response = await aclient.count(collection_name=vector_table_name, exact=True)
+                existing_points_number = count_response.count if count_response else 0
+
+                if existing_points_number:
+                    with engine.connect() as conn:
+                        qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+                        cursor = conn.execute(text(f"SELECT COUNT(*) AS total FROM {qualified_table_name}"))
+                        total = cursor.scalar()
+                    if existing_points_number < total:
+                        await aclient.delete_collection(collection_name=vector_table_name)
+                        await queue.put(table_name)
+            else:
+                await queue.put(table_name)
         except Exception as exc:
             print(f"Skip table '{table_name}' while checking collection existence: {exc}")
             continue
-        if existed:
-            continue
-        await queue.put(table_name)
 
 async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
     engine = sql_database.engine
@@ -829,21 +843,22 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
 
             print("> Table Columns Info:", table_columns_info)
 
-            order_by_columns = []
-            if table_columns_info.create_time_column_name:
-                order_by_columns.append(f"{table_columns_info.create_time_column_name} ASC")
+            # order_by_columns = []
+            # if table_columns_info.create_time_column_name:
+            #     order_by_columns.append(f"{table_columns_info.create_time_column_name} ASC")
             
-            if table_columns_info.update_time_column_name:
-                order_by_columns.append(f"{table_columns_info.update_time_column_name} DESC")
+            # if table_columns_info.update_time_column_name:
+            #     order_by_columns.append(f"{table_columns_info.update_time_column_name} DESC")
 
-            order_by_sql = ""
-            if order_by_columns:
-                order_by_sql = " ORDER BY " + ", ".join(order_by_columns)
+            # order_by_sql = ""
+            # if order_by_columns:
+            #     order_by_sql = " ORDER BY " + ", ".join(order_by_columns)
 
             docs = []
             with engine.connect() as conn:
                 qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
-                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}{order_by_sql}"))
+                # cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}{order_by_sql}"))
+                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}"))
                 rows = cursor.fetchall()
 
                 for row in rows:
