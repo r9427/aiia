@@ -752,26 +752,39 @@ async def index_db_tables(client: QdrantClient, aclient: AsyncQdrantClient, sql_
     except Exception as e:
             raise e
 
+max_embedding_number = 10000
+
 async def produce_queue(queue: asyncio.Queue, aclient: AsyncQdrantClient, sql_database: SQLDatabase):
     engine = sql_database.engine
     identifier_preparer = engine.dialect.identifier_preparer
     for table_name in sql_database.get_usable_table_names():
         vector_table_name = get_vector_table_name(table_name)
         try:
+            with engine.connect() as conn:
+                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+                cursor = conn.execute(text(f"SELECT COUNT(*) AS total FROM {qualified_table_name}"))
+                total = cursor.scalar()
             existed = await aclient.collection_exists(collection_name=vector_table_name)
             if existed:
                 count_response = await aclient.count(collection_name=vector_table_name, exact=True)
                 existing_points_number = count_response.count if count_response else 0
 
                 if existing_points_number:
-                    with engine.connect() as conn:
-                        qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
-                        cursor = conn.execute(text(f"SELECT COUNT(*) AS total FROM {qualified_table_name}"))
-                        total = cursor.scalar()
                     if existing_points_number < total:
                         await aclient.delete_collection(collection_name=vector_table_name)
+
+                        if total > max_embedding_number:
+                            print(f"Skip table '{table_name}' due to too many rows ({total} > {max_embedding_number})")
+                            continue
                         await queue.put(table_name)
             else:
+                await aclient.create_collection(collection_name=vector_table_name)
+                if total > max_embedding_number:
+                    print(f"Skip table '{table_name}' due to too many rows ({total} > {max_embedding_number})")
+                    continue
+                elif total == 0:
+                    print(f"Skip table '{table_name}' due to no rows")
+                    continue
                 await queue.put(table_name)
         except Exception as exc:
             print(f"Skip table '{table_name}' while checking collection existence: {exc}")
@@ -841,7 +854,7 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
                 table_str=table_str
             )
 
-            print("> Table Columns Info:", table_columns_info)
+            # print("> Table Columns Info:", table_columns_info)
 
             # order_by_columns = []
             # if table_columns_info.create_time_column_name:
