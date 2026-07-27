@@ -674,103 +674,13 @@ def _select_table_schema_objs(
     # Fallback: keep behavior flexible and safe if selector output is malformed.
     return table_schema_objs
 
-async def index_all_tables2(
-    sql_database: SQLDatabase
-) -> Dict[str, VectorStoreIndex]:
-    vector_index_dict = {}
-    engine = sql_database.engine
-    identifier_preparer = engine.dialect.identifier_preparer
+async def load_vector_index(sql_database: SQLDatabase, client: QdrantClient, aclient: AsyncQdrantClient, index_table_columns: Dict[str, List[str]]):
+    vector_index_dict = dict()
+    vector_column_index_dict = dict()
 
-    client = QdrantClient(
-        host=SystemUtil.CONFIG.qdrant_host,
-        port=SystemUtil.CONFIG.qdrant_port,
-        timeout=10000
-    )
-    aclient = AsyncQdrantClient(
-        host=SystemUtil.CONFIG.qdrant_host,
-        port=SystemUtil.CONFIG.qdrant_port,
-        timeout=10000
-    )
-
-    init_vector_db = True  # Set to True to index all tables; False to load existing vector store indices.
     for table_name in sql_database.get_usable_table_names():
         vector_table_name = get_vector_table_name(table_name)
-
-        existed = client.collection_exists(collection_name=vector_table_name)
-        if existed and init_vector_db:
-            continue
-
-        vector_store = QdrantVectorStore(
-            collection_name=vector_table_name,
-            client=client,
-            aclient=aclient,
-            prefer_grpc=True,
-            enable_hybrid=True,
-            fastembed_sparse_model="Qdrant/bm25",
-        )
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-        if init_vector_db:
-            print(f"Indexing rows in table: {table_name}")
-            docs = []
-            with engine.connect() as conn:
-                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
-                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name}"))
-                result = cursor.fetchall()
-                # row_tups = []
-                for row in result:
-                    # row_tups.append(tuple(row))
-                    docs.append(Document(text=str(tuple(row)), metadata={"ref_table_name": table_name}))
-
-            # index each row, put into vector store index
-            # docs = [Document(text=str(t)) for t in row_tups]
-
-            # put into vector store index (may fail if embedding provider returns invalid vectors)
-            try:
-                vector_index_dict[table_name] = VectorStoreIndex.from_documents(
-                    documents=docs,
-                    storage_context=storage_context,
-                    use_async=True,
-                    # embed_model=Settings.embed_model,
-                )
-            except Exception as exc:
-                print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
-                continue
-        else:
-            vector_index_dict[table_name] = VectorStoreIndex.from_vector_store(
-                vector_store,
-                # Embedding model should match the original embedding model
-                # embed_model=Settings.embed_model
-            )
-
-    return vector_index_dict
-
-async def index_all_tables(
-    sql_database: SQLDatabase,
-    index_table_columns: Dict[str, List[str]]
-) -> Dict[str, VectorStoreIndex]:
-    vector_index_dict = {}
-    vector_column_index_dict = {}
-    engine = sql_database.engine
-    identifier_preparer = engine.dialect.identifier_preparer
-
-    client = QdrantClient(
-        host=SystemUtil.CONFIG.qdrant_host,
-        port=SystemUtil.CONFIG.qdrant_port,
-        timeout=10000
-    )
-    aclient = AsyncQdrantClient(
-        host=SystemUtil.CONFIG.qdrant_host,
-        port=SystemUtil.CONFIG.qdrant_port,
-        timeout=10000
-    )
-
-    init_vector_db = False  # Set to True to index all tables; False to load existing vector store indices.
-    if init_vector_db:
-        await index_db_tables(client, aclient, sql_database, index_table_columns=index_table_columns)
-    for table_name in sql_database.get_usable_table_names():
-        vector_table_name = get_vector_table_name(table_name)
-        if not client.collection_exists(collection_name=vector_table_name):
+        if not await aclient.collection_exists(collection_name=vector_table_name):
             # Some tables are intentionally skipped during indexing (empty/too large/failed).
             continue
         count_response = await aclient.count(collection_name=vector_table_name, exact=True)
@@ -795,7 +705,7 @@ async def index_all_tables(
     for table_name, columns_to_index in index_table_columns.items():
         for column_name in columns_to_index:
             vector_column_table_name = get_vector_table_name(f"{table_name}_{column_name}")
-            if not client.collection_exists(collection_name=vector_column_table_name):
+            if not await aclient.collection_exists(collection_name=vector_column_table_name):
                 # Some column tables are intentionally skipped during indexing (empty/too large/failed).
                 continue
             count_response = await aclient.count(collection_name=vector_column_table_name, exact=True)
@@ -819,8 +729,36 @@ async def index_all_tables(
 
     return vector_index_dict, vector_column_index_dict
 
+def load_table_infos(client: QdrantClient, aclient: AsyncQdrantClient) -> List[TableInfo]:
+    table_infos = []
+    vector_table_name = get_vector_table_name("table_info")
 
-async def index_db_tables(client: QdrantClient, aclient: AsyncQdrantClient, sql_database: SQLDatabase, index_table_columns: Dict[str, List[str]] = None):
+    vector_store = QdrantVectorStore(
+        collection_name=vector_table_name,
+        client=client,
+        aclient=aclient,
+        prefer_grpc=True,
+        enable_hybrid=True,
+        fastembed_sparse_model="Qdrant/bm25",
+    )
+
+    nodes = vector_store.get_nodes()
+    table_infos = [
+        TableInfo(
+            ref_table_name=node.metadata['ref_table_name'],
+            table_name=node.metadata['table_name'],
+            table_summary=node.metadata['table_summary']
+        )
+        for node in nodes
+    ]
+    
+    return table_infos
+
+async def init_vector_db(sql_database: SQLDatabase, client: QdrantClient, aclient: AsyncQdrantClient, index_table_columns: Dict[str, List[str]] = None):
+    await index_vector_db_tables(sql_database, client, aclient, index_table_columns)
+    await index_vector_db_table_infos(sql_database, client, aclient)
+
+async def index_vector_db_tables(sql_database: SQLDatabase, client: QdrantClient, aclient: AsyncQdrantClient, index_table_columns: Dict[str, List[str]] = None):
     try:
         async with asyncio.TaskGroup() as task_group:
             queue = asyncio.Queue(100)
@@ -836,6 +774,99 @@ async def index_db_tables(client: QdrantClient, aclient: AsyncQdrantClient, sql_
                 consumer.cancel()
     except Exception as e:
             raise e
+
+async def index_vector_db_table_infos(sql_database: SQLDatabase, client: QdrantClient, aclient: AsyncQdrantClient):
+    vector_table_name = get_vector_table_name("table_info")
+
+    vector_store = QdrantVectorStore(
+        collection_name=vector_table_name,
+        client=client,
+        aclient=aclient,
+        prefer_grpc=True,
+        enable_hybrid=True,
+        fastembed_sparse_model="Qdrant/bm25",
+    )
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    
+    prompt_str = """\
+    Create a concise, specific summary for this table.
+
+    Input table payload is JSON, not CSV. It has exactly these keys:
+    - table_name: string
+    - columns: string[]
+    - sample_rows: object[]
+
+    Use only the provided JSON fields (table_name, columns, sample_rows).
+
+    Return JSON only with exactly these keys:
+    - table_name
+    - table_summary
+
+    Output rules:
+    - table_name must be concise, unique, and descriptive.
+    - table_name must not be generic (e.g. table, my_table).
+    - table_name must not be one of: {exclude_table_name_list}
+    - table_summary should describe purpose, main entities, and key value patterns.
+    - No markdown, no code fences, no comments, no extra keys.
+
+    Table JSON:
+    {table_str}
+    """
+
+    prompt_tmpl = ChatPromptTemplate(
+        message_templates=[ChatMessage.from_str(prompt_str, role="user")]
+    )
+
+    summarized_table_names = set()
+    docs = []
+
+    # a = sql_database.get_single_table_info(table_name=table_name)
+    # b = sql_database.get_table_columns(table_name=table_name)
+    engine = sql_database.engine
+    identifier_preparer = engine.dialect.identifier_preparer
+    for table_name in sql_database.get_usable_table_names():
+        # print(f"Indexing rows in table: {table_name}")
+        with engine.connect() as conn:
+            qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
+            cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name} LIMIT 10"))
+            rows = cursor.fetchall()
+            row_tups = []
+            for row in rows:
+                row_tups.append(tuple(row))
+        df_str = _build_table_str_for_prompt(table_name, row_tups, list(cursor.keys()))
+
+        print(f"Process table: {table_name}")
+        table_info = _predict_table_info(
+            ref_table_name=table_name,
+            prompt_tmpl=prompt_tmpl,
+            table_str=df_str,
+            exclude_table_name_list=str(list(summarized_table_names)),
+        )
+        summarized_table_name = table_info.table_name
+        if summarized_table_name not in summarized_table_names:
+            summarized_table_names.add(summarized_table_name)
+
+            # index each row, put into vector store index
+            docs.append(Document(
+                text=str(table_info),
+                metadata={
+                    "ref_table_name": table_info.ref_table_name,
+                    "table_name": table_info.table_name,
+                    "table_summary": table_info.table_summary
+                }
+            ))
+    
+    # put into vector store index (may fail if embedding provider returns invalid vectors)
+    try:
+        index = VectorStoreIndex.from_documents(
+            documents=docs,
+            storage_context=storage_context,
+            use_async=True,
+            # embed_model=Settings.embed_model,
+        )
+    except Exception as exc:
+        print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
+
 
 max_embedding_number = 10000
 
@@ -1219,165 +1250,37 @@ def get_table_context_and_rows_cols_str(
         context_strs.append(table_info)
     return "\n\n".join(context_strs)
 
-def get_table_infos(sql_database: SQLDatabase) -> List[TableInfo]:
-    table_infos = []
-    init_vector_db = False  # Set to True to index all tables; False to load existing vector store indices.
-    vector_table_name = get_vector_table_name("table_info")
+async def run_agent():
+    engine = sql_database.engine
+    identifier_preparer = engine.dialect.identifier_preparer
 
     client = QdrantClient(
         host=SystemUtil.CONFIG.qdrant_host,
         port=SystemUtil.CONFIG.qdrant_port,
+        timeout=10000
     )
     aclient = AsyncQdrantClient(
         host=SystemUtil.CONFIG.qdrant_host,
         port=SystemUtil.CONFIG.qdrant_port,
+        timeout=10000
     )
 
-    vector_store = QdrantVectorStore(
-        collection_name=vector_table_name,
-        client=client,
-        aclient=aclient,
-        prefer_grpc=True,
-        enable_hybrid=True,
-        fastembed_sparse_model="Qdrant/bm25",
-    )
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    
-    if init_vector_db:
-        prompt_str = """\
-        Create a concise, specific summary for this table.
 
-        Input table payload is JSON, not CSV. It has exactly these keys:
-        - table_name: string
-        - columns: string[]
-        - sample_rows: object[]
-
-        Use only the provided JSON fields (table_name, columns, sample_rows).
-
-        Return JSON only with exactly these keys:
-        - table_name
-        - table_summary
-
-        Output rules:
-        - table_name must be concise, unique, and descriptive.
-        - table_name must not be generic (e.g. table, my_table).
-        - table_name must not be one of: {exclude_table_name_list}
-        - table_summary should describe purpose, main entities, and key value patterns.
-        - No markdown, no code fences, no comments, no extra keys.
-
-        Table JSON:
-        {table_str}
-        """
-
-        prompt_tmpl = ChatPromptTemplate(
-            message_templates=[ChatMessage.from_str(prompt_str, role="user")]
-        )
-
-        summarized_table_names = set()
-        docs = []
-
-        # a = sql_database.get_single_table_info(table_name=table_name)
-        # b = sql_database.get_table_columns(table_name=table_name)
-        engine = sql_database.engine
-        identifier_preparer = engine.dialect.identifier_preparer
-        for table_name in sql_database.get_usable_table_names():
-            # print(f"Indexing rows in table: {table_name}")
-            with engine.connect() as conn:
-                qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
-                cursor = conn.execute(text(f"SELECT * FROM {qualified_table_name} LIMIT 10"))
-                rows = cursor.fetchall()
-                row_tups = []
-                for row in rows:
-                    row_tups.append(tuple(row))
-            df_str = _build_table_str_for_prompt(table_name, row_tups, list(cursor.keys()))
-
-            print(f"Process table: {table_name}")
-            table_info = _predict_table_info(
-                ref_table_name=table_name,
-                prompt_tmpl=prompt_tmpl,
-                table_str=df_str,
-                exclude_table_name_list=str(list(summarized_table_names)),
-            )
-            summarized_table_name = table_info.table_name
-            if summarized_table_name not in summarized_table_names:
-                summarized_table_names.add(summarized_table_name)
-                table_infos.append(table_info)
-
-                # index each row, put into vector store index
-                docs.append(Document(
-                    text=str(table_info),
-                    metadata={
-                        "ref_table_name": table_info.ref_table_name,
-                        "table_name": table_info.table_name,
-                        "table_summary": table_info.table_summary
-                    }
-                ))
-        
-        # put into vector store index (may fail if embedding provider returns invalid vectors)
-        try:
-            index = VectorStoreIndex.from_documents(
-                documents=docs,
-                storage_context=storage_context,
-                use_async=True,
-                # embed_model=Settings.embed_model,
-            )
-        except Exception as exc:
-            print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
-    else:
-        nodes = vector_store.get_nodes()
-        table_infos = [
-            TableInfo(
-                ref_table_name=node.metadata['ref_table_name'],
-                table_name=node.metadata['table_name'],
-                table_summary=node.metadata['table_summary']
-            )
-            for node in nodes
-        ]
-    
-    return table_infos
-
-async def run_agent():
-    print("Indexing all tables started")
     index_table_columns: Dict[str, List[str]] = {
         "users": ["name", "email"],
         "issue_feedbacks": ["title", "summary"]
     }
-    vector_index_dict, vector_column_index_dict = await index_all_tables(sql_database, index_table_columns)
-    # vector_index_dict: Dict[str, VectorStoreIndex] = {}
-    print("Indexing all tables  completed")
 
-    # client = QdrantClient(
-    #     host=SystemUtil.CONFIG.qdrant_host,
-    #     port=SystemUtil.CONFIG.qdrant_port,
-    # )
-    # aclient = AsyncQdrantClient(
-    #     host=SystemUtil.CONFIG.qdrant_host,
-    #     port=SystemUtil.CONFIG.qdrant_port,
-    #     timeout=10000
-    # )
-
-    # vector_store = QdrantVectorStore(
-    #     collection_name="car_users_name",
-    #     client=client,
-    #     aclient=aclient,
-    #     prefer_grpc=True,
-    #     enable_hybrid=True,
-    #     fastembed_sparse_model="Qdrant/bm25",
-    # )
-    # vector_index = VectorStoreIndex.from_vector_store(
-    #     vector_store,
-    # )
-    # vector_retriever = vector_index.as_retriever(similarity_top_k=2)
-    # test_query = "zhanbo"
-    # relevant_nodes = vector_retriever.retrieve(test_query)
-    # print("rd relevant_nodes: ", relevant_nodes)
+    init_db = False  # Set to True to index all tables; False to load existing vector store indices.
+    if init_db:
+        print("Indexing all tables started")
+        await init_vector_db(sql_database, client, aclient, index_table_columns)
+        print("Indexing all tables completed")
 
 
-    print("progress: 1")
-
-    table_infos = get_table_infos(sql_database)
-
-    print("progress: 2")
+    vector_index_dict, vector_column_index_dict = await load_vector_index(sql_database, client, aclient, index_table_columns)
+    table_infos = load_table_infos(client, aclient)
+    print("index loaded")
 
     table_node_mapping = SQLTableNodeMapping(sql_database)
     table_schema_objs = [
@@ -1392,8 +1295,6 @@ async def run_agent():
         # index_cls=index_table_columns
     )
     obj_retriever = obj_index.as_retriever(similarity_top_k=3)
-
-
     sql_retriever = SQLRetriever(sql_database)
 
     # default retrieval (return_raw=False)
@@ -1424,20 +1325,12 @@ async def run_agent():
     response_synthesis_prompt = PromptTemplate(
         response_synthesis_prompt_str,
     )
+
+    queries = [
+        "list issues created by user zhanbo 17 days ago, please include issue link and issue id, title, description, user name, create time",
+        "show users and their roles",
+    ]
     
-
-    # draw_all_possible_flows(
-    #     TextToSQLWorkflow1, filename="text_to_sql_table_retrieval.html"
-    # )
-
-    # Read the contents of the HTML file
-    # with open("text_to_sql_table_retrieval.html", "r") as file:
-    #     html_content = file.read()
-
-    # Display the HTML content
-    # display(HTML(html_content))
-
-
     # run some queries
     workflow1 = TextToSQLWorkflow1(
         obj_retriever,
@@ -1453,19 +1346,10 @@ async def run_agent():
         verbose=True,
     )
 
-
-    queries = [
-        "list issues created by zhanbo, please include issue link and issue id, title, description, user name",
-        "show users and their roles",
-    ]
     # response = await workflow.run(
     #     query=queries[1]
     # )
     # print(str(response))
-    print("progress: 3")
-
-    # vector_index_dict = index_all_tables(sql_database)
-    # print("progress: 4")
 
     workflow2 = TextToSQLWorkflow2(
         obj_retriever,
@@ -1480,7 +1364,6 @@ async def run_agent():
         timeout=100
     )
 
-
     workflow3 = TextToSQLWorkflow3(
         obj_retriever,
         text2sql_prompt,
@@ -1494,7 +1377,7 @@ async def run_agent():
         timeout=100
     )
     response = await workflow3.run(query=queries[0])
-    print("progress: 4")
+    print("final result: ")
 
     print(str(response))
 
