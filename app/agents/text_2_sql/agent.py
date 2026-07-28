@@ -338,8 +338,8 @@ class TableInfo(BaseModel):
     ref_table_name: str | None = Field(
         None, description="db table name (original name in database, must be the same as in db)"
     )
-    table_name: str = Field(
-        ..., description="table name (must be underscores and NO spaces)"
+    extracted_table_name: str = Field(
+        ..., description="extracted table name (must be underscores and NO spaces)"
     )
     table_summary: str = Field(
         ..., description="short, concise summary/caption of the table"
@@ -746,7 +746,7 @@ def load_table_infos(client: QdrantClient, aclient: AsyncQdrantClient) -> List[T
     table_infos = [
         TableInfo(
             ref_table_name=node.metadata['ref_table_name'],
-            table_name=node.metadata['table_name'],
+            extracted_table_name=node.metadata['extracted_table_name'],
             table_summary=node.metadata['table_summary']
         )
         for node in nodes
@@ -799,13 +799,13 @@ async def index_vector_db_table_infos(sql_database: SQLDatabase, client: QdrantC
     Use only the provided JSON fields (table_name, columns, sample_rows).
 
     Return JSON only with exactly these keys:
-    - table_name
+    - extracted_table_name
     - table_summary
 
     Output rules:
-    - table_name must be concise, unique, and descriptive.
-    - table_name must not be generic (e.g. table, my_table).
-    - table_name must not be one of: {exclude_table_name_list}
+    - extracted_table_name must be concise, unique, and descriptive.
+    - extracted_table_name must not be generic (e.g. table, my_table).
+    - extracted_table_name must not be one of: {exclude_table_name_list}
     - table_summary should describe purpose, main entities, and key value patterns.
     - No markdown, no code fences, no comments, no extra keys.
 
@@ -817,7 +817,7 @@ async def index_vector_db_table_infos(sql_database: SQLDatabase, client: QdrantC
         message_templates=[ChatMessage.from_str(prompt_str, role="user")]
     )
 
-    summarized_table_names = set()
+    extracted_table_names = set()
     docs = []
 
     # a = sql_database.get_single_table_info(table_name=table_name)
@@ -840,18 +840,18 @@ async def index_vector_db_table_infos(sql_database: SQLDatabase, client: QdrantC
             ref_table_name=table_name,
             prompt_tmpl=prompt_tmpl,
             table_str=df_str,
-            exclude_table_name_list=str(list(summarized_table_names)),
+            exclude_table_name_list=str(list(extracted_table_names)),
         )
-        summarized_table_name = table_info.table_name
-        if summarized_table_name not in summarized_table_names:
-            summarized_table_names.add(summarized_table_name)
+        extracted_table_name = table_info.extracted_table_name
+        if extracted_table_name not in extracted_table_names:
+            extracted_table_names.add(extracted_table_name)
 
             # index each row, put into vector store index
             docs.append(Document(
                 text=str(table_info),
                 metadata={
                     "ref_table_name": table_info.ref_table_name,
-                    "table_name": table_info.table_name,
+                    "extracted_table_name": table_info.extracted_table_name,
                     "table_summary": table_info.table_summary
                 }
             ))
@@ -862,7 +862,7 @@ async def index_vector_db_table_infos(sql_database: SQLDatabase, client: QdrantC
             documents=docs,
             storage_context=storage_context,
             use_async=True,
-            # embed_model=Settings.embed_model,
+            embed_model=Settings.embed_model,
         )
     except Exception as exc:
         print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
@@ -942,7 +942,6 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
     engine = sql_database.engine
     identifier_preparer = engine.dialect.identifier_preparer
 
-
     prompt_str = """\
         Identify the table's ID/create-time/update-time columns.
 
@@ -972,7 +971,6 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
         message_templates=[ChatMessage.from_str(prompt_str, role="user")]
     )
 
-
     while True:
         table_name = await queue.get()
         try:
@@ -985,9 +983,9 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
                 prefer_grpc=True,
                 enable_hybrid=True,
                 fastembed_sparse_model="Qdrant/bm25",
+                batch_size=20
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
 
             with engine.connect() as conn:
                 qualified_table_name = _qualified_table_name(identifier_preparer, table_name)
@@ -1052,7 +1050,7 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
                     documents=docs,
                     storage_context=storage_context,
                     use_async=True,
-                    # embed_model=Settings.embed_model,
+                    embed_model=Settings.embed_model,
                 )
 
                 # index columns
@@ -1088,13 +1086,14 @@ async def consume_queue(queue: asyncio.Queue, client: QdrantClient, aclient: Asy
                             prefer_grpc=True,
                             enable_hybrid=True,
                             fastembed_sparse_model="Qdrant/bm25",
+                            batch_size=20
                         )
                         column_storage_context = StorageContext.from_defaults(vector_store=column_vector_store)
                         VectorStoreIndex.from_documents(
                             documents=column_docs,
                             storage_context=column_storage_context,
                             use_async=True,
-                            # embed_model=Settings.embed_model,
+                            embed_model=Settings.embed_model,
                         )
             except Exception as exc:
                 print(f"Skip indexing table '{table_name}' due to embedding error: {exc}")
@@ -1207,6 +1206,7 @@ def get_table_context_and_rows_cols_str(
 ):
     """Get table context string."""
     context_strs = []
+    user_queried = False
     for table_schema_obj in table_schema_objs:
         # first append table info + additional context
         table_info = sql_database.get_single_table_info(
@@ -1221,7 +1221,11 @@ def get_table_context_and_rows_cols_str(
         vector_index = vector_index_dict.get(table_schema_obj.table_name)
         # vector_index = vector_index_dict
         if vector_index is not None:
-            vector_retriever = vector_index.as_retriever(similarity_top_k=2)
+            vector_retriever = vector_index.as_retriever(
+                similarity_top_k=3,
+                sparse_top_k=12,
+                vector_store_query_mode="hybrid"
+            )
             relevant_nodes = vector_retriever.retrieve(query_str)
             if len(relevant_nodes) > 0:
                 table_row_context = "\nHere are some relevant example rows (values in the same order as columns above)\n"
@@ -1231,10 +1235,31 @@ def get_table_context_and_rows_cols_str(
         else:
             print(f"> No row index found for table: {table_schema_obj.table_name}")
 
+
+        # user_vector_index = vector_index_dict.get('users')
+        # if not user_queried and user_vector_index is not None:
+        #     user_vector_retriever = user_vector_index.as_retriever(
+        #         similarity_top_k=2,
+        #         sparse_top_k=5,
+        #         vector_store_query_mode="hybrid"
+        #     )
+        #     relevant_user_nodes = user_vector_retriever.retrieve(query_str)
+        #     if len(relevant_user_nodes) > 0:
+        #         table_row_context = "\nHere are some relevant example rows (values in the same order as columns above)\n"
+        #         for node in relevant_user_nodes:
+        #             table_row_context += str(node.get_content()) + "\n"
+        #         table_info += table_row_context
+        #     user_queried = True
+
+
         for column_name in index_table_columns.get(table_schema_obj.table_name, []):
             vector_column_index = vector_column_index_dict.get(f"{table_schema_obj.table_name}_{column_name}")
             if vector_column_index is not None:
-                vector_column_retriever = vector_column_index.as_retriever(similarity_top_k=2)
+                vector_column_retriever = vector_column_index.as_retriever(
+                    similarity_top_k=2,
+                    sparse_top_k=12,
+                    vector_store_query_mode="hybrid"
+                )
                 relevant_column_nodes = vector_column_retriever.retrieve(query_str)
                 if len(relevant_column_nodes) > 0:
                     table_column_context = f"\nHere are some relevant example values for column '{column_name}'\n"
@@ -1271,7 +1296,7 @@ async def run_agent():
         "issue_feedbacks": ["title", "summary"]
     }
 
-    init_db = False  # Set to True to index all tables; False to load existing vector store indices.
+    init_db = True  # Set to True to index all tables; False to load existing vector store indices.
     if init_db:
         print("Indexing all tables started")
         await init_vector_db(sql_database, client, aclient, index_table_columns)
@@ -1294,7 +1319,11 @@ async def run_agent():
         VectorStoreIndex,
         # index_cls=index_table_columns
     )
-    obj_retriever = obj_index.as_retriever(similarity_top_k=3)
+    obj_retriever = obj_index.as_retriever(
+        similarity_top_k=4,
+        # sparse_top_k=8,
+        # vector_store_query_mode="hybrid"
+    )
     sql_retriever = SQLRetriever(sql_database)
 
     # default retrieval (return_raw=False)
@@ -1309,9 +1338,9 @@ async def run_agent():
         "\n\nWhen generating SQL for MySQL:"
         "\n- Do not use reserved keywords as table aliases (e.g., IF, KEY, ORDER, GROUP)."
         "\n- Prefer safe aliases like t1, t2, u, r, ur, fb."
-        "\n- For human/name filters from natural language (e.g., 'created by tom', 'user john'), prefer case-insensitive fuzzy matching instead of exact equality."
-        "\n- Use patterns like LOWER(TRIM(u.name)) LIKE CONCAT('%', LOWER(TRIM('<name>')), '%') when matching user names."
-        "\n- Only use '=' for names when the user explicitly asks for exact match."
+        # "\n- For human/name filters from natural language (e.g., 'created by tom', 'user john'), prefer case-insensitive fuzzy matching instead of exact equality."
+        # "\n- Use patterns like LOWER(TRIM(u.name)) LIKE CONCAT('%', LOWER(TRIM('<name>')), '%') when matching user names."
+        # "\n- Only use '=' for names when the user explicitly asks for exact match."
     )
     # print(text2sql_prompt.template)
 
@@ -1327,7 +1356,7 @@ async def run_agent():
     )
 
     queries = [
-        "list issues created by user zhanbo 17 days ago, please include issue link and issue id, title, description, user name, create time",
+        "list issues created by cariad employee zhanbo 18 days ago, please include issue link and issue id, title, description, user name, create time",
         "show users and their roles",
     ]
     
@@ -1374,7 +1403,7 @@ async def run_agent():
         response_synthesis_prompt,
         llm,
         verbose=False,
-        timeout=100
+        timeout=1000000
     )
     response = await workflow3.run(query=queries[0])
     print("final result: ")
