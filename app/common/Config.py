@@ -31,8 +31,8 @@ class Config(object):
         self.tools_tavily_api_key = Util.strip_string(os.getenv("TOOLS_TAVILY_API_KEY", None) or parser['tools']['tavily_api_key'])
 
     def get_db_url(self):
-        # return self.get_pg_url()
-        return self.get_mysql_url()
+        return self.get_pg_url()
+        # return self.get_mysql_url()
 
     def get_pg_url(self):
         return Template(
